@@ -1,9 +1,8 @@
 // pid_macro_sliding_window.C
-// Modified to use sliding/overlapping windows instead of discrete slices
-// - Uses a moving window (e.g., 0.3-0.5, 0.31-0.51, 0.32-0.52, etc.)
-// - Creates many more fit points for smoother contours
-// - Only displays first 10 fits in canvas (to keep figures readable)
-// - All fits are used for contours and parameter plots
+// Performs 4 parallel sliding window scans with different widths:
+// 1x (0.2), 2x (0.4), 4x (0.8), 8x (1.6)
+// ITERATIVE BACKGROUND: tries pol0, pol1, pol2, pol3, pol4 and picks best chi2/ndf
+// All scans end at the same a-value (centers aligned at ~5.9)
 
 #include <iostream>
 #include <fstream>
@@ -24,6 +23,7 @@
 #include "TLegend.h"
 #include "TLine.h"
 #include "TGraph.h"
+#include "TMultiGraph.h"
 #include "TAxis.h"
 #include "TDirectory.h"
 #include "TMath.h"
@@ -32,7 +32,135 @@
 
 using std::cout; using std::endl;
 
-//void pid_macro() {
+// Structure to hold fit results
+struct FitResult {
+  bool success;
+  double mean;
+  double sigma;
+  double amplitude;
+  int polyOrder;        // Which polynomial order was best (0-4)
+  double chi2ndf;
+  std::vector<double> bkgParams;  // Background parameters
+  double entries;
+};
+
+// Function to try fitting with different polynomial backgrounds
+FitResult tryFitWithPolynomials(TH1D* proj, double fitMin, double fitMax, int sliceIdx, int widthIdx) {
+  FitResult best;
+  best.success = false;
+  best.mean = 139.57;
+  best.sigma = 10.0;
+  best.amplitude = 0.0;
+  best.polyOrder = 1;
+  best.chi2ndf = 1e9;
+  best.entries = proj ? proj->GetEntries() : 0;
+
+  if (!proj || best.entries < 20) return best;
+
+  int bin_min = proj->FindFixBin(fitMin);
+  int bin_max = proj->FindFixBin(fitMax);
+  double integral = proj->Integral(bin_min, bin_max);
+  if (integral < 5.0) return best;
+
+  // Find peak position
+  int maxBin = 0;
+  double maxVal = -1.0;
+  for (int b = bin_min; b <= bin_max; ++b) {
+    double v = proj->GetBinContent(b);
+    if (v > maxVal) { maxVal = v; maxBin = b; }
+  }
+  double peakPos = (maxBin > 0) ? proj->GetBinCenter(maxBin) : 139.57;
+
+  // Try polynomial orders 0 through 4
+  for (int polyOrder = 0; polyOrder <= 4; ++polyOrder) {
+    // Build fit function: gaus(0) + pol<N>(3)
+    TString funcName = Form("tryfit_w%d_s%d_p%d", widthIdx, sliceIdx, polyOrder);
+    TString funcExpr;
+    int nBkgParams = polyOrder + 1;
+    
+    switch (polyOrder) {
+      case 0: funcExpr = "gaus(0) + [3]"; break;
+      case 1: funcExpr = "gaus(0) + pol1(3)"; break;
+      case 2: funcExpr = "gaus(0) + pol2(3)"; break;
+      case 3: funcExpr = "gaus(0) + pol3(3)"; break;
+      case 4: funcExpr = "gaus(0) + pol4(3)"; break;
+    }
+
+    TF1* fitFunc = new TF1(funcName, funcExpr, fitMin, fitMax);
+    
+    // Initialize Gaussian parameters
+    fitFunc->SetParameter(0, std::max(1.0, maxVal * 0.8));  // amplitude
+    fitFunc->SetParameter(1, peakPos);                       // mean
+    fitFunc->SetParameter(2, 10.0);                          // sigma
+    
+    // Initialize background parameters
+    double bkgLevel = proj->GetBinContent(bin_min);
+    fitFunc->SetParameter(3, bkgLevel);
+    for (int p = 1; p < nBkgParams; ++p) {
+      fitFunc->SetParameter(3 + p, 0.0);
+    }
+
+    // Set parameter limits
+    fitFunc->SetParLimits(0, 0.0, std::max(10.0, 2.0 * maxVal + 1.0));
+    fitFunc->SetParLimits(1, 100.0, 180.0);
+    fitFunc->SetParLimits(2, 2.0, 40.0);
+
+    // Perform fit
+    TFitResultPtr result = proj->Fit(fitFunc, "SQR0");  // 0 = don't draw
+
+    bool valid = false;
+    double chi2ndf = 1e9;
+
+    if (result.Get() && result->IsValid() && result->Status() == 0) {
+      double fMean = fitFunc->GetParameter(1);
+      double fSigma = fitFunc->GetParameter(2);
+      double fAmp = fitFunc->GetParameter(0);
+
+      // Quality checks
+      if (fMean > 115.0 && fMean < 165.0 && 
+          fSigma > 2.0 && fSigma < 40.0 && 
+          fAmp > 0.5) {
+        valid = true;
+        if (result->Ndf() > 0) {
+          chi2ndf = result->Chi2() / result->Ndf();
+        } else {
+          chi2ndf = 1e6;  // Penalize if no DOF
+        }
+      }
+    }
+
+    // Check if this is the best fit so far
+    if (valid && chi2ndf < best.chi2ndf) {
+      best.success = true;
+      best.mean = fitFunc->GetParameter(1);
+      best.sigma = fitFunc->GetParameter(2);
+      best.amplitude = fitFunc->GetParameter(0);
+      best.polyOrder = polyOrder;
+      best.chi2ndf = chi2ndf;
+      best.bkgParams.clear();
+      for (int p = 0; p < nBkgParams; ++p) {
+        best.bkgParams.push_back(fitFunc->GetParameter(3 + p));
+      }
+    }
+
+    delete fitFunc;
+  }
+
+  return best;
+}
+
+// Build background function string based on polynomial order
+TString getBkgFuncExpr(int polyOrder) {
+  switch (polyOrder) {
+    case 0: return "[0]";
+    case 1: return "pol1";
+    case 2: return "pol2";
+    case 3: return "pol3";
+    case 4: return "pol4";
+    default: return "pol1";
+  }
+}
+
 void pid_macro_multistep_beta() {
   gROOT->SetBatch(kFALSE);
   gStyle->SetOptStat(0);
@@ -63,14 +191,13 @@ void pid_macro_multistep_beta() {
   cout << "TChain built: files added = " << added << ", entries = " << nEnt << endl;
 
   // --- Parameter
-  //const double sSquared = 1e-6;
   const double sSquared = 1e-4;
 
-  // --- Build 2D hist: X=mass-like, Y=a-parameter (both signed by p)
+  // --- Build 2D hist: X=mass-like, Y=a-parameter
   const char* h2name = "h2_pid_mass_vs_a";
   TString drawCmd = Form(
     "sqrt(1 + %.1e*pim_p*pim_p - pow(1-pim_beta*pim_beta,2)) * sign(pim_p) : "
-    "pim_p*sqrt(1/pow(pim_beta,2) - 1) * sign(pim_p) >> %s(300,0,300,300,0,3)",
+    "pim_p*sqrt(1/pow(pim_beta,2) - 1) * sign(pim_p) >> %s(300,0,300,700,0,7)",
     sSquared, h2name);
 
   if (gDirectory->FindObject(h2name)) gDirectory->Delete(Form("%s;*", h2name));
@@ -85,309 +212,404 @@ void pid_macro_multistep_beta() {
   h2->GetXaxis()->SetTitle("Mass [MeV/c^{2}]");
   h2->GetYaxis()->SetTitle("a * sign(p)");
 
-  // --- Define sliding window parameters
-  const double windowWidth = 0.2;   // Width of each window (e.g., 0.5 - 0.3 = 0.2)
-  const double stepSize = 0.01;     // Step between consecutive windows
-  const double startLower = 0.3;    // Starting lower bound
-  const double maxUpper = 2.3;      // Maximum upper bound we want to reach
-
-  // Calculate number of slices
-  const int nSlices = static_cast<int>((maxUpper - windowWidth - startLower) / stepSize) + 1;
+  // --- Sliding window parameters
+  const double baseWidth = 0.2;
+  const double stepSize = 0.01;
+  const double startLower = 0.3;
+  const double targetMaxCenter = 5.9;
   
-  cout << "Using sliding windows: width=" << windowWidth 
-       << ", step=" << stepSize 
-       << ", total slices=" << nSlices << endl;
+  // Fit range extended to 80-220
+  const double fitRangeMin = 80.0;
+  const double fitRangeMax = 220.0;
 
-  // --- Storage (using vectors for dynamic size)
-  std::vector<double> sliceCenters(nSlices, 0.0);
-  std::vector<double> pionMean(nSlices, 0.0);
-  std::vector<double> pionSigma(nSlices, 0.0);
-  std::vector<double> pionAmplitude(nSlices, 0.0);
-  std::vector<bool>   fitSuccess(nSlices, false);
+  // Width multipliers for 4 parallel scans
+  const int nWidths = 4;
+  double widthMultipliers[nWidths] = {1.0, 2.0, 4.0, 8.0};
+  TString widthLabels[nWidths] = {"1x", "2x", "4x", "8x"};
+  int widthColors[nWidths] = {kBlue, kGreen+2, kOrange+1, kRed};
 
-  // --- Define which windows to display (corresponding to original discrete slices)
-  // Original slices were: [0.3,0.5], [0.5,0.7], [0.7,0.9], [0.9,1.1], [1.1,1.3], 
-  //                       [1.3,1.5], [1.5,1.7], [1.7,1.9], [1.9,2.1], [2.1,2.3]
-  // These have lower bounds at: 0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1
-  // With startLower=0.3 and stepSize=0.01: index = (lowerBound - 0.3) / 0.01
-  std::vector<int> displayIndices;
-  for (double lb = 0.3; lb <= 2.1 + 0.001; lb += 0.2) {
-    int idx = static_cast<int>((lb - startLower) / stepSize + 0.5); // round to nearest
-    if (idx >= 0 && idx < nSlices) {
-      displayIndices.push_back(idx);
+  // --- Storage for all width scans
+  std::vector<std::vector<double>> allSliceCenters(nWidths);
+  std::vector<std::vector<FitResult>> allFitResults(nWidths);
+
+  // --- Create canvases for fit displays (one per width)
+  TCanvas* cFits[nWidths];
+  const int nDisplayPerWidth = 12;
+  
+  for (int w = 0; w < nWidths; ++w) {
+    TString canvasName = Form("c_fit_%s", widthLabels[w].Data());
+    TString canvasTitle = Form("Pion Fits - Width %s (%.2f)", widthLabels[w].Data(), baseWidth * widthMultipliers[w]);
+    cFits[w] = new TCanvas(canvasName, canvasTitle, 1200, 800);
+    cFits[w]->Divide(4, 3);
+    cout << "Created canvas: " << canvasName << endl;
+  }
+
+  // --- Perform scans for each width
+  for (int w = 0; w < nWidths; ++w) {
+    double currentWidth = baseWidth * widthMultipliers[w];
+    double maxUpper = targetMaxCenter + currentWidth / 2.0;
+    
+    int nSlices = static_cast<int>((maxUpper - currentWidth - startLower) / stepSize) + 1;
+    if (nSlices < 1) nSlices = 1;
+    
+    cout << "\n========================================" << endl;
+    cout << "=== Width " << widthLabels[w] << " (" << currentWidth << ") ===" << endl;
+    cout << "========================================" << endl;
+    cout << "maxUpper = " << maxUpper << ", nSlices = " << nSlices << endl;
+    
+    double firstCenter = startLower + currentWidth / 2.0;
+    double lastCenter = startLower + (nSlices - 1) * stepSize + currentWidth / 2.0;
+    cout << "Centers: first=" << firstCenter << ", last=" << lastCenter << endl;
+
+    // Resize storage
+    allSliceCenters[w].resize(nSlices);
+    allFitResults[w].resize(nSlices);
+
+    // Determine display indices - evenly spaced
+    std::vector<int> displayIndices;
+    if (nSlices >= nDisplayPerWidth) {
+      for (int d = 0; d < nDisplayPerWidth; ++d) {
+        int idx = (int)((double)d * (nSlices - 1) / (nDisplayPerWidth - 1) + 0.5);
+        displayIndices.push_back(idx);
+      }
+    } else {
+      for (int i = 0; i < nSlices; ++i) displayIndices.push_back(i);
     }
-  }
-  
-  cout << "Total slices to compute: " << nSlices << endl;
-  cout << "Will display fits at indices: ";
-  for (size_t d = 0; d < displayIndices.size(); ++d) {
-    cout << displayIndices[d];
-    if (d < displayIndices.size() - 1) cout << ", ";
-  }
-  cout << endl;
-  
-  // --- Canvas for fits (show representative windows matching original discrete slices)
-  TCanvas* cFit = new TCanvas("c_fit", "Pion Fits - Original 10 slices: [0.3-0.5], [0.5-0.7], ..., [2.1-2.3]", 1200, 800);
-  cFit->Divide(4, 3); // 12 pads, use first 10
+    
+    cout << "Display indices (" << displayIndices.size() << "): ";
+    for (size_t d = 0; d < displayIndices.size(); ++d) cout << displayIndices[d] << " ";
+    cout << endl;
 
-  TCanvas* cSel = new TCanvas("c_sel", "Pion Selection", 800, 600);
+    // --- First pass: perform all fits
+    int nSuccess = 0;
+    int polyOrderCounts[5] = {0, 0, 0, 0, 0};
+    
+    for (int i = 0; i < nSlices; ++i) {
+      double lowerBound = startLower + i * stepSize;
+      double upperBound = lowerBound + currentWidth;
+      double center = 0.5 * (lowerBound + upperBound);
+      allSliceCenters[w][i] = center;
 
-  const double fitRangeMin = 100.0;
-  const double fitRangeMax = 180.0;
+      // Create projection
+      int ybin_lo = h2->GetYaxis()->FindFixBin(lowerBound + 1e-6);
+      int ybin_hi = h2->GetYaxis()->FindFixBin(upperBound - 1e-6);
+      
+      TString projName = Form("proj_fit_w%d_%d", w, i);
+      if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
+      TH1D* proj = h2->ProjectionX(projName, ybin_lo, ybin_hi, "e");
 
-  // --- Iterate over sliding windows
-  for (int i = 0; i < nSlices; ++i) {
-    const double lowerBound = startLower + i * stepSize;
-    const double upperBound = lowerBound + windowWidth;
-    sliceCenters[i] = 0.5 * (lowerBound + upperBound);
+      // Try fitting with different polynomial backgrounds
+      FitResult result = tryFitWithPolynomials(proj, fitRangeMin, fitRangeMax, i, w);
+      allFitResults[w][i] = result;
 
-    // Check if this window should be displayed (matches original discrete slices)
-    bool drawThisFit = false;
-    int padNumber = 0;
+      if (result.success) {
+        nSuccess++;
+        polyOrderCounts[result.polyOrder]++;
+      }
+
+      // Progress output
+      if (i < 3 || i % 100 == 0 || i == nSlices - 1) {
+        cout << Form("  Slice %4d/%d: a=%.2f, entries=%.0f, fit=%s",
+                     i, nSlices, center, result.entries,
+                     result.success ? Form("OK (pol%d, chi2/ndf=%.2f)", result.polyOrder, result.chi2ndf) : "FAIL") << endl;
+      }
+
+      delete proj;
+    }
+
+    cout << "\nWidth " << widthLabels[w] << " summary: " << nSuccess << "/" << nSlices << " successful" << endl;
+    cout << "Polynomial order distribution: ";
+    for (int p = 0; p <= 4; ++p) cout << "pol" << p << "=" << polyOrderCounts[p] << " ";
+    cout << endl;
+
+    // --- Second pass: create display histograms
+    cout << "\nCreating display histograms for width " << widthLabels[w] << "..." << endl;
+    
     for (size_t d = 0; d < displayIndices.size(); ++d) {
-      if (i == displayIndices[d]) {
-        drawThisFit = true;
-        padNumber = d + 1;
-        cout << Form("Drawing fit %d (%.2f-%.2f) in pad %d", i, lowerBound, upperBound, padNumber) << endl;
-        break;
-      }
-    }
-    
-    TPad* pad = nullptr;
-    
-    if (drawThisFit) {
-      cFit->cd(padNumber);
-      pad = static_cast<TPad*>(cFit->GetPad(padNumber));
-      pad->SetLeftMargin(0.12);
-      pad->SetRightMargin(0.04);
-      pad->SetTopMargin(0.08);
-      pad->SetBottomMargin(0.12);
-    }
+      int i = displayIndices[d];
+      int padNum = d + 1;
+      
+      double lowerBound = startLower + i * stepSize;
+      double upperBound = lowerBound + currentWidth;
+      double center = allSliceCenters[w][i];
+      FitResult& result = allFitResults[w][i];
 
-    // ProjectionX on X (mass) for Y in [lowerBound, upperBound]
-    const int ybin_lo = h2->GetYaxis()->FindFixBin(lowerBound + 1e-6);
-    const int ybin_hi = h2->GetYaxis()->FindFixBin(upperBound - 1e-6);
-    TString projName = Form("proj_%d", i);
-    if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
-    TH1D* proj = h2->ProjectionX(projName, ybin_lo, ybin_hi, "e");
+      cFits[w]->cd(padNum);
+      gPad->SetLeftMargin(0.12);
+      gPad->SetRightMargin(0.04);
+      gPad->SetTopMargin(0.10);
+      gPad->SetBottomMargin(0.12);
 
-    // Defaults
-    pionMean[i]      = 139.57;
-    pionSigma[i]     = 10.0;
-    pionAmplitude[i] = 0.0;
-    fitSuccess[i]    = false;
+      // Create projection for display
+      int ybin_lo = h2->GetYaxis()->FindFixBin(lowerBound + 1e-6);
+      int ybin_hi = h2->GetYaxis()->FindFixBin(upperBound - 1e-6);
+      
+      TString projName = Form("proj_disp_w%d_d%d", w, (int)d);
+      if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
+      TH1D* proj = h2->ProjectionX(projName, ybin_lo, ybin_hi, "e");
 
-    // Basic content checks
-    const double entries = proj ? proj->GetEntries() : 0.0;
-    const int bin_min = proj ? proj->FindFixBin(fitRangeMin) : 1;
-    const int bin_max = proj ? proj->FindFixBin(fitRangeMax) : 0;
-    const double integral_roi = (proj && bin_max >= bin_min) ? proj->Integral(bin_min, bin_max) : 0.0;
-
-    if (i < 5 || i % 20 == 0) {  // Print only some to avoid spam
-      cout << Form("Slice %3d: a in [%.2f, %.2f], entries=%.0f, integral[%.0f,%.0f]=%.0f",
-                    i, lowerBound, upperBound, entries, fitRangeMin, fitRangeMax, integral_roi) << endl;
-    }
-
-    if (proj && entries > 20 && integral_roi > 5.0) {
-      // Seed peak near the maximum inside ROI
-      int maxBin = 0; double maxVal = -1.0;
-      for (int b = bin_min; b <= bin_max; ++b) {
-        double v = proj->GetBinContent(b);
-        if (v > maxVal) { maxVal = v; maxBin = b; }
-      }
-      const double peakPos = (maxBin>0) ? proj->GetBinCenter(maxBin) : 139.57;
-
-      TF1* fitFunc = new TF1(Form("fit_%d", i), "gaus(0) + pol1(3)", fitRangeMin, fitRangeMax);
-      fitFunc->SetLineColor(kRed);
-      // Init
-      fitFunc->SetParameter(0, std::max(1.0, maxVal)); // amplitude
-      fitFunc->SetParameter(1, peakPos);               // mean
-      fitFunc->SetParameter(2, 10.0);                  // sigma
-      fitFunc->SetParameter(3, proj->GetBinContent(bin_min)); // bkg level guess
-      fitFunc->SetParameter(4, 0.0);                   // bkg slope
-      // Limits
-      fitFunc->SetParLimits(0, 0.0, std::max(10.0, 2.0*maxVal+1.0));
-      fitFunc->SetParLimits(1, 120.0, 160.0);
-      fitFunc->SetParLimits(2, 2.0, 30.0);
-
-      // Quiet, return, use range
-      TFitResultPtr result = proj->Fit(fitFunc, "SQR");
-
-      bool valid = false; int status = -1;
-      if (result.Get()) {
-        status = result->Status();
-        valid = result->IsValid() && status == 0;
+      if (!proj) {
+        cout << "  WARNING: Could not create projection for display " << d << endl;
+        continue;
       }
 
-      if (valid) {
-        pionMean[i]      = fitFunc->GetParameter(1);
-        pionSigma[i]     = fitFunc->GetParameter(2);
-        pionAmplitude[i] = fitFunc->GetParameter(0);
-        fitSuccess[i]    = true;
-      }
-    }
-
-    // Display cosmetics (only for shown fits)
-    if (proj && drawThisFit) {
-      // Draw the histogram first
-      proj->GetXaxis()->SetRangeUser(fitRangeMin, fitRangeMax);
       proj->SetTitle(Form("%.2f < a < %.2f", lowerBound, upperBound));
+      proj->GetXaxis()->SetRangeUser(fitRangeMin, fitRangeMax);
       proj->GetXaxis()->SetTitle("Mass [MeV/c^{2}]");
       proj->GetYaxis()->SetTitle("Counts");
       proj->GetXaxis()->SetTitleSize(0.05);
       proj->GetYaxis()->SetTitleSize(0.05);
-      proj->GetXaxis()->SetTitleOffset(1.0);
-      proj->GetYaxis()->SetTitleOffset(1.2);
       proj->SetLineColor(kBlack);
+      proj->SetMarkerStyle(20);
+      proj->SetMarkerSize(0.4);
       proj->Draw("E");
 
-      // Draw fit components if fit succeeded
-      if (fitSuccess[i]) {
-        // Redraw the fit function
-        TF1* fitFunc = (TF1*)gDirectory->Get(Form("fit_%d", i));
-        if (fitFunc) fitFunc->Draw("same");
+      // Draw fit if successful
+      if (result.success) {
+        // Build and draw total fit function
+        TString funcExpr;
+        switch (result.polyOrder) {
+          case 0: funcExpr = "gaus(0) + [3]"; break;
+          case 1: funcExpr = "gaus(0) + pol1(3)"; break;
+          case 2: funcExpr = "gaus(0) + pol2(3)"; break;
+          case 3: funcExpr = "gaus(0) + pol3(3)"; break;
+          case 4: funcExpr = "gaus(0) + pol4(3)"; break;
+        }
         
-        // Draw signal component
-        TF1* signalOnly = new TF1(Form("signal_%d", i), "gaus", fitRangeMin, fitRangeMax);
-        signalOnly->SetParameters(pionAmplitude[i], pionMean[i], pionSigma[i]);
-        signalOnly->SetLineColor(kBlue);
-        signalOnly->SetLineStyle(kDashed);
-        signalOnly->Draw("same");
+        TF1* fitFunc = new TF1(Form("fitdisp_w%d_d%d", w, (int)d), funcExpr, fitRangeMin, fitRangeMax);
+        fitFunc->SetParameter(0, result.amplitude);
+        fitFunc->SetParameter(1, result.mean);
+        fitFunc->SetParameter(2, result.sigma);
+        for (size_t p = 0; p < result.bkgParams.size(); ++p) {
+          fitFunc->SetParameter(3 + p, result.bkgParams[p]);
+        }
+        fitFunc->SetLineColor(kRed);
+        fitFunc->SetLineWidth(2);
+        fitFunc->Draw("same");
 
-        // Draw background component  
-        TF1* fitFuncForBkg = (TF1*)gDirectory->Get(Form("fit_%d", i));
-        if (fitFuncForBkg) {
-          TF1* bkgOnly = new TF1(Form("bkg_%d", i), "pol1", fitRangeMin, fitRangeMax);
-          bkgOnly->SetParameters(fitFuncForBkg->GetParameter(3), fitFuncForBkg->GetParameter(4));
-          bkgOnly->SetLineColor(kGreen+1);
-          bkgOnly->SetLineStyle(kDashed);
-          bkgOnly->Draw("same");
+        // Signal component (Gaussian)
+        TF1* sig = new TF1(Form("sig_w%d_d%d", w, (int)d), "gaus", fitRangeMin, fitRangeMax);
+        sig->SetParameters(result.amplitude, result.mean, result.sigma);
+        sig->SetLineColor(kBlue);
+        sig->SetLineStyle(kDashed);
+        sig->SetLineWidth(2);
+        sig->Draw("same");
+
+        // Background component
+        TString bkgExpr = getBkgFuncExpr(result.polyOrder);
+        TF1* bkg = new TF1(Form("bkg_w%d_d%d", w, (int)d), bkgExpr, fitRangeMin, fitRangeMax);
+        for (size_t p = 0; p < result.bkgParams.size(); ++p) {
+          bkg->SetParameter(p, result.bkgParams[p]);
+        }
+        bkg->SetLineColor(kGreen+2);
+        bkg->SetLineStyle(kDashed);
+        bkg->SetLineWidth(2);
+        bkg->Draw("same");
+      }
+
+      // Labels
+      TLatex tex;
+      tex.SetNDC();
+      tex.SetTextSize(0.042);
+      if (result.success) {
+        tex.DrawLatex(0.52, 0.82, Form("Mean=%.1f", result.mean));
+        tex.DrawLatex(0.52, 0.74, Form("#sigma=%.1f", result.sigma));
+        tex.DrawLatex(0.52, 0.66, Form("Bkg: pol%d", result.polyOrder));
+        tex.DrawLatex(0.52, 0.58, Form("#chi^{2}/ndf=%.1f", result.chi2ndf));
+      } else {
+        tex.SetTextColor(kRed);
+        tex.DrawLatex(0.52, 0.82, "Fit failed");
+        tex.SetTextColor(kBlack);
+      }
+      tex.DrawLatex(0.52, 0.50, Form("N=%.0f", result.entries));
+
+      gPad->Modified();
+      gPad->Update();
+      
+      cout << "  Pad " << padNum << ": slice " << i << ", a=" << center << ", fit=" << (result.success ? "OK" : "FAIL") << endl;
+    }
+
+    cFits[w]->Modified();
+    cFits[w]->Update();
+    cout << "Canvas " << widthLabels[w] << " updated." << endl;
+  }
+
+  // --- Create 2D contour plots for each width
+  TCanvas* cContours[nWidths];
+  
+  for (int w = 0; w < nWidths; ++w) {
+    double currentWidth = baseWidth * widthMultipliers[w];
+    cContours[w] = new TCanvas(Form("c_contour_%s", widthLabels[w].Data()),
+                               Form("Pion Selection - Width %s (%.2f)", widthLabels[w].Data(), currentWidth),
+                               800, 600);
+    cContours[w]->cd();
+    h2->Draw("colz");
+
+    // Build contours
+    std::vector<double> massPoints[3], aPoints[3];
+    int nSlices = allSliceCenters[w].size();
+    
+    // Forward pass
+    for (int i = 0; i < nSlices; ++i) {
+      if (allFitResults[w][i].success) {
+        for (int s = 0; s < 3; ++s) {
+          double nSig = s + 1;
+          massPoints[s].push_back(allFitResults[w][i].mean + nSig * allFitResults[w][i].sigma);
+          aPoints[s].push_back(allSliceCenters[w][i]);
         }
       }
-
-      TLatex latex; latex.SetNDC(); latex.SetTextSize(0.05); latex.SetTextColor(kBlack);
-      if (fitSuccess[i]) {
-        latex.DrawLatex(0.15, 0.85, Form("Mean = %.1f", pionMean[i]));
-        latex.DrawLatex(0.15, 0.78, Form("#sigma = %.1f", pionSigma[i]));
-      } else {
-        latex.DrawLatex(0.15, 0.85, "Fit failed / empty");
-      }
-      
-      pad->Modified();
-      pad->Update();
     }
     
-    // Don't delete displayed projections - ROOT manages them
-    // Only clean up non-displayed ones
-    if (!drawThisFit && proj) {
-      delete proj;
-    }
-  }
-
-  cout << "Completed " << nSlices << " sliding window fits." << endl;
-  
-  // Final update of the fit canvas
-  cFit->Modified();
-  cFit->Update();
-
-  // --- Selection contours on 2D
-  cSel->cd();
-  h2->Draw("colz");
-
-  std::vector<double> massPoints[3], aPoints[3];
-  
-  // Forward pass (mean + n*sigma)
-  for (int i = 0; i < nSlices; ++i) {
-    if (fitSuccess[i]) {
-      for (int s = 0; s < 3; ++s) {
-        const double nS = s + 1;
-        massPoints[s].push_back(pionMean[i] + nS * pionSigma[i]);
-        aPoints[s].push_back(sliceCenters[i]);
+    // Backward pass
+    for (int i = nSlices - 1; i >= 0; --i) {
+      if (allFitResults[w][i].success) {
+        for (int s = 0; s < 3; ++s) {
+          double nSig = s + 1;
+          massPoints[s].push_back(allFitResults[w][i].mean - nSig * allFitResults[w][i].sigma);
+          aPoints[s].push_back(allSliceCenters[w][i]);
+        }
       }
     }
-  }
-  
-  // Backward pass (mean - n*sigma)
-  for (int i = nSlices - 1; i >= 0; --i) {
-    if (fitSuccess[i]) {
-      for (int s = 0; s < 3; ++s) {
-        const double nS = s + 1;
-        massPoints[s].push_back(pionMean[i] - nS * pionSigma[i]);
-        aPoints[s].push_back(sliceCenters[i]);
+
+    // Draw contours - thick lines
+    int contColors[3] = {kBlue, kGreen+2, kRed};
+    TGraph* graphs[3] = {nullptr, nullptr, nullptr};
+    
+    for (int s = 0; s < 3; ++s) {
+      if (!massPoints[s].empty()) {
+        graphs[s] = new TGraph(massPoints[s].size(), massPoints[s].data(), aPoints[s].data());
+        graphs[s]->SetLineColor(contColors[s]);
+        graphs[s]->SetLineWidth(6);
+        graphs[s]->Draw("L");
       }
     }
-  }
 
-  TGraph* contours[3] = {nullptr, nullptr, nullptr};
-  int colors[3] = {kBlue, kGreen+2, kRed};
-  for (int s = 0; s < 3; ++s) {
-    if (!massPoints[s].empty()) {
-      contours[s] = new TGraph((int)massPoints[s].size(), massPoints[s].data(), aPoints[s].data());
-      contours[s]->SetLineColor(colors[s]);
-      contours[s]->SetLineWidth(2);
-      contours[s]->Draw("L");
-    }
-  }
-
-  if (contours[0] || contours[1] || contours[2]) {
-    TLegend* leg = new TLegend(0.7, 0.7, 0.9, 0.9);
-    if (contours[0]) leg->AddEntry(contours[0], "1#sigma", "l");
-    if (contours[1]) leg->AddEntry(contours[1], "2#sigma", "l");
-    if (contours[2]) leg->AddEntry(contours[2], "3#sigma", "l");
+    TLegend* leg = new TLegend(0.7, 0.7, 0.88, 0.88);
+    leg->SetHeader(Form("Width: %s", widthLabels[w].Data()));
+    if (graphs[0]) leg->AddEntry(graphs[0], "1#sigma", "l");
+    if (graphs[1]) leg->AddEntry(graphs[1], "2#sigma", "l");
+    if (graphs[2]) leg->AddEntry(graphs[2], "3#sigma", "l");
     leg->SetBorderSize(1);
     leg->Draw();
+
+    cContours[w]->Modified();
+    cContours[w]->Update();
   }
+
+  // --- Combined contour comparison plot
+  TCanvas* cCombined = new TCanvas("c_combined", "Contour Comparison - All Widths (3#sigma)", 1000, 800);
+  cCombined->cd();
+  h2->Draw("colz");
+
+  TLegend* legComb = new TLegend(0.7, 0.65, 0.88, 0.88);
+  legComb->SetHeader("3#sigma contours");
+
+  for (int w = 0; w < nWidths; ++w) {
+    std::vector<double> massPoints, aPoints;
+    int nSlices = allSliceCenters[w].size();
+    
+    for (int i = 0; i < nSlices; ++i) {
+      if (allFitResults[w][i].success) {
+        massPoints.push_back(allFitResults[w][i].mean + 3.0 * allFitResults[w][i].sigma);
+        aPoints.push_back(allSliceCenters[w][i]);
+      }
+    }
+    for (int i = nSlices - 1; i >= 0; --i) {
+      if (allFitResults[w][i].success) {
+        massPoints.push_back(allFitResults[w][i].mean - 3.0 * allFitResults[w][i].sigma);
+        aPoints.push_back(allSliceCenters[w][i]);
+      }
+    }
+
+    if (!massPoints.empty()) {
+      TGraph* g = new TGraph(massPoints.size(), massPoints.data(), aPoints.data());
+      g->SetLineColor(widthColors[w]);
+      g->SetLineWidth(6);
+      g->Draw("L");
+      legComb->AddEntry(g, Form("Width %s", widthLabels[w].Data()), "l");
+    }
+  }
+  legComb->Draw();
+  cCombined->Modified();
+  cCombined->Update();
 
   // --- Mean/Sigma vs a
   TCanvas* cPar = new TCanvas("c_par", "Pion Parameters vs. a", 1000, 450);
-  cPar->Divide(2,1);
+  cPar->Divide(2, 1);
 
-  // Mean
+  // Mean plot
   cPar->cd(1);
-  TGraph* gMean = new TGraph();
-  int nPoints = 0;
-  for (int i = 0; i < nSlices; ++i) {
-    if (fitSuccess[i]) {
-      gMean->SetPoint(nPoints++, sliceCenters[i], pionMean[i]);
+  gPad->SetLeftMargin(0.12);
+  gPad->SetBottomMargin(0.12);
+  
+  TMultiGraph* mgMean = new TMultiGraph();
+  TLegend* legMean = new TLegend(0.65, 0.70, 0.88, 0.88);
+  
+  for (int w = 0; w < nWidths; ++w) {
+    TGraph* g = new TGraph();
+    int np = 0;
+    for (size_t i = 0; i < allSliceCenters[w].size(); ++i) {
+      if (allFitResults[w][i].success) {
+        g->SetPoint(np++, allSliceCenters[w][i], allFitResults[w][i].mean);
+      }
+    }
+    if (np > 0) {
+      g->SetMarkerStyle(20 + w);
+      g->SetMarkerSize(0.4);
+      g->SetMarkerColor(widthColors[w]);
+      g->SetLineColor(widthColors[w]);
+      mgMean->Add(g, "LP");
+      legMean->AddEntry(g, Form("Width %s", widthLabels[w].Data()), "lp");
     }
   }
-  gMean->SetTitle("Pion Mass vs. a-parameter");
-  gMean->GetXaxis()->SetTitle("a-parameter");
-  gMean->GetYaxis()->SetTitle("Mean [MeV/c^{2}]");
-  gMean->GetYaxis()->SetRangeUser(130, 150);
-  gMean->SetMarkerStyle(20);
-  gMean->SetMarkerSize(0.5);  // Smaller markers since we have many points
-  gMean->SetMarkerColor(kBlue);
-  gMean->SetLineColor(kBlue);
-  gMean->Draw("ALP");
-  {
-    TF1* constLine = new TF1("constLine", "139.57", 0, 3);
-    constLine->SetLineColor(kRed);
-    constLine->SetLineStyle(kDashed);
-    constLine->Draw("same");
-    TLegend* legMean = new TLegend(0.7, 0.2, 0.9, 0.4);
-    legMean->AddEntry(gMean, "Fitted Mean", "lp");
-    legMean->AddEntry(constLine, "Pion Mass (139.57)", "l");
-    legMean->Draw();
-  }
+  
+  mgMean->SetTitle("Pion Mass vs. a-parameter;a-parameter;Mean [MeV/c^{2}]");
+  mgMean->Draw("A");
+  mgMean->GetXaxis()->SetLimits(0.0, 6.0);
+  mgMean->GetYaxis()->SetRangeUser(120.0, 160.0);
+  
+  TF1* constLine = new TF1("constLine", "139.57", 0, 6.5);
+  constLine->SetLineColor(kBlack);
+  constLine->SetLineStyle(kDashed);
+  constLine->SetLineWidth(2);
+  constLine->Draw("same");
+  legMean->AddEntry(constLine, "m_{#pi} = 139.57", "l");
+  legMean->Draw();
 
-  // Sigma
+  // Sigma plot
   cPar->cd(2);
-  TGraph* gSigma = new TGraph(); 
-  nPoints = 0;
-  for (int i = 0; i < nSlices; ++i) {
-    if (fitSuccess[i]) {
-      gSigma->SetPoint(nPoints++, sliceCenters[i], pionSigma[i]);
+  gPad->SetLeftMargin(0.12);
+  gPad->SetBottomMargin(0.12);
+  
+  TMultiGraph* mgSigma = new TMultiGraph();
+  TLegend* legSigma = new TLegend(0.65, 0.70, 0.88, 0.88);
+  
+  for (int w = 0; w < nWidths; ++w) {
+    TGraph* g = new TGraph();
+    int np = 0;
+    for (size_t i = 0; i < allSliceCenters[w].size(); ++i) {
+      if (allFitResults[w][i].success) {
+        g->SetPoint(np++, allSliceCenters[w][i], allFitResults[w][i].sigma);
+      }
+    }
+    if (np > 0) {
+      g->SetMarkerStyle(20 + w);
+      g->SetMarkerSize(0.4);
+      g->SetMarkerColor(widthColors[w]);
+      g->SetLineColor(widthColors[w]);
+      mgSigma->Add(g, "LP");
+      legSigma->AddEntry(g, Form("Width %s", widthLabels[w].Data()), "lp");
     }
   }
-  gSigma->SetTitle("Pion Width vs. a-parameter");
-  gSigma->GetXaxis()->SetTitle("a-parameter");
-  gSigma->GetYaxis()->SetTitle("#sigma [MeV/c^{2}]");
-  gSigma->SetMarkerStyle(20);
-  gSigma->SetMarkerSize(0.5);  // Smaller markers since we have many points
-  gSigma->SetMarkerColor(kRed);
-  gSigma->SetLineColor(kRed);
-  gSigma->Draw("ALP");
+  
+  mgSigma->SetTitle("Pion Width vs. a-parameter;a-parameter;#sigma [MeV/c^{2}]");
+  mgSigma->Draw("A");
+  mgSigma->GetXaxis()->SetLimits(0.0, 6.0);
+  mgSigma->GetYaxis()->SetRangeUser(0.0, 35.0);
+  legSigma->Draw();
+
+  cPar->Modified();
+  cPar->Update();
 
   // --- Full mass spectrum
   TCanvas* cMass = new TCanvas("c_mass", "Full Mass Spectrum", 800, 600);
@@ -402,59 +624,50 @@ void pid_macro_multistep_beta() {
     hfull->SetLineColor(kBlue);
     hfull->SetFillColor(kCyan-10);
     TLine* pionLine = new TLine(139.57, 0, 139.57, hfull->GetMaximum());
-    pionLine->SetLineColor(kRed); 
-    pionLine->SetLineWidth(2); 
-    pionLine->SetLineStyle(kDashed); 
+    pionLine->SetLineColor(kRed);
+    pionLine->SetLineWidth(2);
+    pionLine->SetLineStyle(kDashed);
     pionLine->Draw("same");
-    TLegend* legFull = new TLegend(0.7, 0.7, 0.9, 0.9);
-    legFull->AddEntry(hfull, "Mass Spectrum", "lf");
-    legFull->AddEntry(pionLine, "Pion Mass (139.57)", "l");
-    legFull->Draw();
   }
 
   // --- Save results
   std::ofstream outfile("pion_fit_results.txt");
-  outfile << "a-parameter\tMean [MeV/c^2]\tSigma [MeV/c^2]\tAmplitude\tFit Status" << std::endl;
-  cout << "\nSummary of fit results (first 20 and last 5):" << std::endl;
-  cout << "a-parameter\tMean [MeV/c^2]\tSigma [MeV/c^2]\tAmplitude\tFit Status" << std::endl;
+  outfile << "Width\ta-center\tMean\tSigma\tAmplitude\tPolyOrder\tChi2/NDF\tStatus" << std::endl;
   
-  for (int i = 0; i < nSlices; ++i) {
-    outfile << sliceCenters[i] << "\t"
-            << pionMean[i] << "\t"
-            << pionSigma[i] << "\t"
-            << pionAmplitude[i] << "\t"
-            << (fitSuccess[i] ? "Success" : "Failed") << std::endl;
-    
-    // Print only subset to console to avoid spam
-    if (i < 20 || i >= nSlices - 5) {
-      cout << sliceCenters[i] << "\t"
-           << pionMean[i] << "\t"
-           << pionSigma[i] << "\t"
-           << pionAmplitude[i] << "\t"
-           << (fitSuccess[i] ? "Success" : "Failed") << std::endl;
-    } else if (i == 20) {
-      cout << "... (" << (nSlices - 25) << " more entries) ..." << std::endl;
+  for (int w = 0; w < nWidths; ++w) {
+    for (size_t i = 0; i < allSliceCenters[w].size(); ++i) {
+      FitResult& r = allFitResults[w][i];
+      outfile << widthLabels[w] << "\t"
+              << allSliceCenters[w][i] << "\t"
+              << r.mean << "\t"
+              << r.sigma << "\t"
+              << r.amplitude << "\t"
+              << r.polyOrder << "\t"
+              << r.chi2ndf << "\t"
+              << (r.success ? "OK" : "FAIL") << std::endl;
     }
   }
   outfile.close();
 
-  // Count successful fits
-  int nSuccess = 0;
-  for (int i = 0; i < nSlices; ++i) {
-    if (fitSuccess[i]) nSuccess++;
-  }
-  cout << "\nTotal successful fits: " << nSuccess << " out of " << nSlices << endl;
-
   // --- Save canvases
-  cFit->SaveAs("pion_fits.png");
-  cSel->SaveAs("pion_contours.png");
+  for (int w = 0; w < nWidths; ++w) {
+    cFits[w]->SaveAs(Form("pion_fits_%s.png", widthLabels[w].Data()));
+    cContours[w]->SaveAs(Form("pion_contours_%s.png", widthLabels[w].Data()));
+  }
+  cCombined->SaveAs("pion_contours_combined.png");
   cPar->SaveAs("pion_parameters.png");
   cMass->SaveAs("pion_mass_spectrum.png");
 
-  cout << "\nAnalysis complete. Results saved to:" << endl
-       << "- pion_fits.png (shows 10 representative windows matching original slices)" << endl
-       << "- pion_contours.png (smooth contours from all fits)" << endl
-       << "- pion_parameters.png (parameters from all fits)" << endl
-       << "- pion_mass_spectrum.png" << endl
-       << "- pion_fit_results.txt (all " << nSlices << " fits)" << endl;
+  cout << "\n=== Analysis complete ===" << endl;
+  cout << "Fit range: " << fitRangeMin << " - " << fitRangeMax << " MeV/c^2" << endl;
+  cout << "Background: iterative pol0-pol4, best chi2/ndf selected" << endl;
+  cout << "\nSaved files:" << endl;
+  for (int w = 0; w < nWidths; ++w) {
+    cout << "  - pion_fits_" << widthLabels[w] << ".png" << endl;
+    cout << "  - pion_contours_" << widthLabels[w] << ".png" << endl;
+  }
+  cout << "  - pion_contours_combined.png" << endl;
+  cout << "  - pion_parameters.png" << endl;
+  cout << "  - pion_mass_spectrum.png" << endl;
+  cout << "  - pion_fit_results.txt" << endl;
 }
