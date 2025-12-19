@@ -1,9 +1,7 @@
 // pid_macro_sliding_window.C
 // Performs 4 parallel sliding window scans with different widths
-// ADAPTIVE WIDTH: Above a=6, widths increase by factor 4
-//   Below a=6: 1x(0.2), 2x(0.4), 4x(0.8), 8x(1.6)
-//   Above a=6: 1x->4x(0.8), 2x->8x(1.6), 4x->16x(3.2), 8x->32x(6.4)
-// Extended to maxUpper=15 to cover full momentum range
+// Regular fits up to a = 5, then ONE final wide slice from a=5 to a=15
+// This captures all remaining high-momentum pions in sparse region
 
 #include <iostream>
 #include <fstream>
@@ -36,8 +34,8 @@ using std::cout; using std::endl;
 
 // Global parameters
 const double gSSquared = 1e-4;
-const double gTransitionA = 6.0;  // Transition point for width change
-const double gWidthMultiplierAbove = 4.0;  // Factor to increase width above transition
+const double gRegularMaxA = 5.0;    // Regular fitting stops here
+const double gFinalSliceEnd = 15.0; // Final wide slice extends to here
 
 // Structure to hold fit results
 struct FitResult {
@@ -49,7 +47,10 @@ struct FitResult {
   double chi2ndf;
   std::vector<double> bkgParams;
   double entries;
-  double windowWidth;  // Actual window width used
+  double windowWidth;
+  double lowerBound;
+  double upperBound;
+  bool isFinalSlice;  // Flag for the final wide slice
 };
 
 // Convert (mass, a) -> (p, beta)
@@ -113,7 +114,8 @@ bool massAToMomBeta(double mass, double a, double s2, double& p_out, double& bet
 }
 
 // Fit with polynomial background selection
-FitResult tryFitWithPolynomials(TH1D* proj, double fitMin, double fitMax, int sliceIdx, int widthIdx, double windowWidth) {
+FitResult tryFitWithPolynomials(TH1D* proj, double fitMin, double fitMax, int sliceIdx, int widthIdx, 
+                                 double windowWidth, double lowerBound, double upperBound, bool isFinal) {
   FitResult best;
   best.success = false;
   best.mean = 139.57;
@@ -123,6 +125,9 @@ FitResult tryFitWithPolynomials(TH1D* proj, double fitMin, double fitMax, int sl
   best.chi2ndf = 1e9;
   best.entries = proj ? proj->GetEntries() : 0;
   best.windowWidth = windowWidth;
+  best.lowerBound = lowerBound;
+  best.upperBound = upperBound;
+  best.isFinalSlice = isFinal;
 
   if (!proj || best.entries < 20) return best;
 
@@ -160,8 +165,8 @@ FitResult tryFitWithPolynomials(TH1D* proj, double fitMin, double fitMax, int sl
     
     double bkgLevel = proj->GetBinContent(bin_min);
     fitFunc->SetParameter(3, bkgLevel);
-    for (int p = 1; p < nBkgParams; ++p)
-      fitFunc->SetParameter(3 + p, 0.0);
+    for (int pp = 1; pp < nBkgParams; ++pp)
+      fitFunc->SetParameter(3 + pp, 0.0);
 
     fitFunc->SetParLimits(0, 0.0, std::max(10.0, 2.0 * maxVal + 1.0));
     fitFunc->SetParLimits(1, 100.0, 180.0);
@@ -193,8 +198,8 @@ FitResult tryFitWithPolynomials(TH1D* proj, double fitMin, double fitMax, int sl
       best.polyOrder = polyOrder;
       best.chi2ndf = chi2ndf;
       best.bkgParams.clear();
-      for (int p = 0; p < nBkgParams; ++p)
-        best.bkgParams.push_back(fitFunc->GetParameter(3 + p));
+      for (int pp = 0; pp < nBkgParams; ++pp)
+        best.bkgParams.push_back(fitFunc->GetParameter(3 + pp));
     }
 
     delete fitFunc;
@@ -245,7 +250,7 @@ void pid_macro_multistep_beta() {
 
   const double sSquared = gSSquared;
 
-  // --- 2D histograms - extended Y range to 16
+  // --- 2D histograms - Y range to 16 to see everything
   const char* h2name = "h2_pid_mass_vs_a";
   TString drawCmd = Form(
     "sqrt(1 + %.1e*pim_p*pim_p - pow(1-pim_beta*pim_beta,2)) * sign(pim_p) : "
@@ -286,93 +291,107 @@ void pid_macro_multistep_beta() {
 
   // --- Parameters
   const double baseWidth = 0.2;
-  const double stepSize = 0.02;  // Slightly larger step for extended range
+  const double stepSize = 0.01;
   const double startLower = 0.3;
-  const double maxUpper = 15.0;  // Extended!
+  const double regularMaxA = gRegularMaxA;  // Regular fits up to here
+  const double finalSliceEnd = gFinalSliceEnd;  // Final slice extends to here
   
   const double fitRangeMin = 80.0;
   const double fitRangeMax = 220.0;
 
-  // Width multipliers
+  // Width multipliers for regular fits
   const int nWidths = 4;
-  double baseMultipliers[nWidths] = {1.0, 2.0, 4.0, 8.0};
-  double highAMultipliers[nWidths] = {4.0, 8.0, 16.0, 32.0};  // Above transition
-  TString widthLabels[nWidths] = {"1x/4x", "2x/8x", "4x/16x", "8x/32x"};
+  double widthMultipliers[nWidths] = {1.0, 2.0, 4.0, 8.0};
+  TString widthLabels[nWidths] = {"1x", "2x", "4x", "8x"};
   int widthColors[nWidths] = {kBlue, kGreen+2, kOrange+1, kRed};
 
-  // For p-beta plots
+  // For p-beta plots (4x and 8x)
   int pbIndices[2] = {2, 3};
 
   // --- Storage
   std::vector<std::vector<double>> allSliceCenters(nWidths);
   std::vector<std::vector<FitResult>> allFitResults(nWidths);
 
-  // --- Create fit canvases
+  // --- Create fit canvases (12 regular + 1 final = show 12 with last being final)
   TCanvas* cFits[nWidths];
   const int nDisplayPerWidth = 12;
   
   for (int w = 0; w < nWidths; ++w) {
     cFits[w] = new TCanvas(Form("c_fit_%d", w),
-                           Form("Pion Fits - Width %s (below/above a=%.0f)", widthLabels[w].Data(), gTransitionA),
+                           Form("Pion Fits - Width %s (regular + final slice)", widthLabels[w].Data()),
                            1200, 800);
     cFits[w]->Divide(4, 3);
   }
 
   // --- Perform scans
   for (int w = 0; w < nWidths; ++w) {
-    double lowWidth = baseWidth * baseMultipliers[w];
-    double highWidth = baseWidth * highAMultipliers[w];
+    double currentWidth = baseWidth * widthMultipliers[w];
     
     cout << "\n=============================================" << endl;
-    cout << "=== Width " << widthLabels[w] << ": " << lowWidth << " (a<" << gTransitionA 
-         << "), " << highWidth << " (a>=" << gTransitionA << ") ===" << endl;
+    cout << "=== Width " << widthLabels[w] << " (" << currentWidth << ") ===" << endl;
+    cout << "=== Regular fits: a = " << startLower << " to " << regularMaxA << endl;
+    cout << "=== Final slice: a = " << regularMaxA << " to " << finalSliceEnd << endl;
     cout << "=============================================" << endl;
 
-    // Build slice list with adaptive widths
+    // Build slice list for regular fits
     std::vector<double> centers;
-    std::vector<double> widths;
     std::vector<double> lowerBounds;
     std::vector<double> upperBounds;
+    std::vector<double> widths;
+    std::vector<bool> isFinal;
     
+    // Regular slices
     double currentA = startLower;
-    while (currentA < maxUpper) {
-      double width = (currentA < gTransitionA) ? lowWidth : highWidth;
+    while (currentA + currentWidth <= regularMaxA + 0.001) {
       double lower = currentA;
-      double upper = currentA + width;
+      double upper = currentA + currentWidth;
       double center = 0.5 * (lower + upper);
-      
-      if (upper > maxUpper + 0.5 * width) break;  // Don't go too far
       
       lowerBounds.push_back(lower);
       upperBounds.push_back(upper);
       centers.push_back(center);
-      widths.push_back(width);
+      widths.push_back(currentWidth);
+      isFinal.push_back(false);
       
-      // Step: use smaller steps below transition, larger above
-      double step = (currentA < gTransitionA) ? stepSize : stepSize * 2.0;
-      currentA += step;
+      currentA += stepSize;
     }
     
+    // Add ONE final wide slice from regularMaxA to finalSliceEnd
+    double finalWidth = finalSliceEnd - regularMaxA;
+    double finalCenter = 0.5 * (regularMaxA + finalSliceEnd);
+    lowerBounds.push_back(regularMaxA);
+    upperBounds.push_back(finalSliceEnd);
+    centers.push_back(finalCenter);
+    widths.push_back(finalWidth);
+    isFinal.push_back(true);
+    
     int nSlices = centers.size();
+    int nRegular = nSlices - 1;
+    
+    cout << "Regular slices: " << nRegular << ", plus 1 final slice" << endl;
     cout << "Total slices: " << nSlices << endl;
-    cout << "First center: " << centers[0] << ", Last center: " << centers[nSlices-1] << endl;
+    cout << "Final slice: a = [" << regularMaxA << ", " << finalSliceEnd << "], width = " << finalWidth << endl;
 
     allSliceCenters[w] = centers;
     allFitResults[w].resize(nSlices);
 
-    // Display indices - evenly spaced
+    // Display indices - 11 regular evenly spaced + 1 final
     std::vector<int> displayIndices;
-    for (int d = 0; d < nDisplayPerWidth; ++d) {
-      int idx = (nSlices > 1) ? (int)((double)d * (nSlices - 1) / (nDisplayPerWidth - 1) + 0.5) : 0;
+    for (int d = 0; d < nDisplayPerWidth - 1; ++d) {
+      int idx = (nRegular > 1) ? (int)((double)d * (nRegular - 1) / (nDisplayPerWidth - 2) + 0.5) : 0;
+      if (idx >= nRegular) idx = nRegular - 1;
       displayIndices.push_back(idx);
     }
+    displayIndices.push_back(nSlices - 1);  // Always show final slice
     
     cout << "Display indices: ";
-    for (int idx : displayIndices) cout << idx << "(" << centers[idx] << ") ";
+    for (int idx : displayIndices) {
+      cout << idx << "(a=" << centers[idx] << (isFinal[idx] ? ",FINAL" : "") << ") ";
+    }
     cout << endl;
 
-    // First pass: fits
-    int nSuccess = 0, nBelowTrans = 0, nAboveTrans = 0;
+    // Perform all fits
+    int nSuccess = 0, nSuccessRegular = 0;
     for (int i = 0; i < nSlices; ++i) {
       int ybin_lo = h2->GetYaxis()->FindFixBin(lowerBounds[i] + 1e-6);
       int ybin_hi = h2->GetYaxis()->FindFixBin(upperBounds[i] - 1e-6);
@@ -381,27 +400,29 @@ void pid_macro_multistep_beta() {
       if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
       TH1D* proj = h2->ProjectionX(projName, ybin_lo, ybin_hi, "e");
 
-      allFitResults[w][i] = tryFitWithPolynomials(proj, fitRangeMin, fitRangeMax, i, w, widths[i]);
+      allFitResults[w][i] = tryFitWithPolynomials(proj, fitRangeMin, fitRangeMax, i, w, 
+                                                   widths[i], lowerBounds[i], upperBounds[i], isFinal[i]);
       
       if (allFitResults[w][i].success) {
         nSuccess++;
-        if (centers[i] < gTransitionA) nBelowTrans++;
-        else nAboveTrans++;
+        if (!isFinal[i]) nSuccessRegular++;
       }
 
-      if (i < 5 || i % 50 == 0 || i == nSlices - 1) {
-        cout << Form("  Slice %3d: a=%.2f, width=%.2f, entries=%.0f, fit=%s", 
-                     i, centers[i], widths[i], allFitResults[w][i].entries,
-                     allFitResults[w][i].success ? Form("OK(pol%d)", allFitResults[w][i].polyOrder) : "FAIL") << endl;
+      if (i < 5 || i % 50 == 0 || i == nSlices - 1 || isFinal[i]) {
+        cout << Form("  Slice %3d: a=[%.2f,%.2f], width=%.2f, entries=%.0f, fit=%s%s", 
+                     i, lowerBounds[i], upperBounds[i], widths[i], 
+                     allFitResults[w][i].entries,
+                     allFitResults[w][i].success ? Form("OK(pol%d)", allFitResults[w][i].polyOrder) : "FAIL",
+                     isFinal[i] ? " [FINAL SLICE]" : "") << endl;
       }
       delete proj;
     }
     
     cout << "Success: " << nSuccess << "/" << nSlices 
-         << " (below a=" << gTransitionA << ": " << nBelowTrans 
-         << ", above: " << nAboveTrans << ")" << endl;
+         << " (regular: " << nSuccessRegular << "/" << nRegular << ", final: " 
+         << (allFitResults[w][nSlices-1].success ? "OK" : "FAIL") << ")" << endl;
 
-    // Second pass: display
+    // Display fits
     for (size_t d = 0; d < displayIndices.size(); ++d) {
       int i = displayIndices[d];
       FitResult& result = allFitResults[w][i];
@@ -420,9 +441,14 @@ void pid_macro_multistep_beta() {
       TH1D* proj = h2->ProjectionX(projName, ybin_lo, ybin_hi, "e");
       if (!proj) continue;
 
-      // Title shows if in high-a region
-      TString regionTag = (centers[i] >= gTransitionA) ? " [HIGH]" : "";
-      proj->SetTitle(Form("%.1f<a<%.1f (w=%.1f)%s", lowerBounds[i], upperBounds[i], widths[i], regionTag.Data()));
+      // Title - mark final slice specially
+      TString title;
+      if (isFinal[i]) {
+        title = Form("FINAL: %.1f < a < %.1f", lowerBounds[i], upperBounds[i]);
+      } else {
+        title = Form("%.2f < a < %.2f", lowerBounds[i], upperBounds[i]);
+      }
+      proj->SetTitle(title);
       proj->GetXaxis()->SetRangeUser(fitRangeMin, fitRangeMax);
       proj->GetXaxis()->SetTitle("Mass [MeV/c^{2}]");
       proj->GetYaxis()->SetTitle("Counts");
@@ -470,16 +496,21 @@ void pid_macro_multistep_beta() {
       TLatex tex;
       tex.SetNDC();
       tex.SetTextSize(0.040);
+      if (isFinal[i]) {
+        tex.SetTextColor(kMagenta+1);
+        tex.DrawLatex(0.50, 0.82, "FINAL SLICE");
+        tex.SetTextColor(kBlack);
+      }
       if (result.success) {
-        tex.DrawLatex(0.50, 0.82, Form("Mean=%.1f", result.mean));
-        tex.DrawLatex(0.50, 0.74, Form("#sigma=%.1f", result.sigma));
-        tex.DrawLatex(0.50, 0.66, Form("pol%d, #chi^{2}=%.1f", result.polyOrder, result.chi2ndf));
+        tex.DrawLatex(0.50, 0.74, Form("Mean=%.1f", result.mean));
+        tex.DrawLatex(0.50, 0.66, Form("#sigma=%.1f", result.sigma));
+        tex.DrawLatex(0.50, 0.58, Form("pol%d, #chi^{2}=%.1f", result.polyOrder, result.chi2ndf));
       } else {
         tex.SetTextColor(kRed);
-        tex.DrawLatex(0.50, 0.82, "Fit failed");
+        tex.DrawLatex(0.50, 0.74, "Fit failed");
+        tex.SetTextColor(kBlack);
       }
-      tex.SetTextColor(kBlack);
-      tex.DrawLatex(0.50, 0.58, Form("N=%.0f", result.entries));
+      tex.DrawLatex(0.50, 0.50, Form("N=%.0f", result.entries));
       
       gPad->Modified();
       gPad->Update();
@@ -499,6 +530,7 @@ void pid_macro_multistep_beta() {
     std::vector<double> massPoints[3], aPoints[3];
     int nSlices = allSliceCenters[w].size();
     
+    // Forward pass
     for (int i = 0; i < nSlices; ++i) {
       if (allFitResults[w][i].success) {
         for (int s = 0; s < 3; ++s) {
@@ -507,6 +539,7 @@ void pid_macro_multistep_beta() {
         }
       }
     }
+    // Backward pass
     for (int i = nSlices - 1; i >= 0; --i) {
       if (allFitResults[w][i].success) {
         for (int s = 0; s < 3; ++s) {
@@ -527,19 +560,19 @@ void pid_macro_multistep_beta() {
       }
     }
 
-    // Draw transition line
-    TLine* transLine = new TLine(0, gTransitionA, 300, gTransitionA);
+    // Draw transition line at regularMaxA
+    TLine* transLine = new TLine(0, regularMaxA, 300, regularMaxA);
     transLine->SetLineColor(kMagenta);
     transLine->SetLineStyle(kDashed);
     transLine->SetLineWidth(2);
     transLine->Draw("same");
 
-    TLegend* leg = new TLegend(0.65, 0.65, 0.88, 0.88);
+    TLegend* leg = new TLegend(0.65, 0.60, 0.88, 0.88);
     leg->SetHeader(Form("Width: %s", widthLabels[w].Data()));
     if (graphs[0]) leg->AddEntry(graphs[0], "1#sigma", "l");
     if (graphs[1]) leg->AddEntry(graphs[1], "2#sigma", "l");
     if (graphs[2]) leg->AddEntry(graphs[2], "3#sigma", "l");
-    leg->AddEntry(transLine, Form("a=%.0f transition", gTransitionA), "l");
+    leg->AddEntry(transLine, Form("a=%.0f (final slice)", regularMaxA), "l");
     leg->Draw();
     cContours[w]->Modified();
     cContours[w]->Update();
@@ -550,13 +583,13 @@ void pid_macro_multistep_beta() {
   cCombined3->cd();
   h2->Draw("colz");
   
-  TLine* transLine3 = new TLine(0, gTransitionA, 300, gTransitionA);
+  TLine* transLine3 = new TLine(0, regularMaxA, 300, regularMaxA);
   transLine3->SetLineColor(kMagenta);
   transLine3->SetLineStyle(kDashed);
   transLine3->SetLineWidth(2);
   transLine3->Draw("same");
   
-  TLegend* legComb3 = new TLegend(0.65, 0.60, 0.88, 0.88);
+  TLegend* legComb3 = new TLegend(0.65, 0.55, 0.88, 0.88);
   legComb3->SetHeader("3#sigma contours");
 
   for (int w = 0; w < nWidths; ++w) {
@@ -580,7 +613,7 @@ void pid_macro_multistep_beta() {
       legComb3->AddEntry(g, Form("%s", widthLabels[w].Data()), "l");
     }
   }
-  legComb3->AddEntry(transLine3, Form("a=%.0f transition", gTransitionA), "l");
+  legComb3->AddEntry(transLine3, Form("a=%.0f (final slice)", regularMaxA), "l");
   legComb3->Draw();
   cCombined3->Modified();
   cCombined3->Update();
@@ -590,13 +623,13 @@ void pid_macro_multistep_beta() {
   cCombined1->cd();
   h2->Draw("colz");
   
-  TLine* transLine1 = new TLine(0, gTransitionA, 300, gTransitionA);
+  TLine* transLine1 = new TLine(0, regularMaxA, 300, regularMaxA);
   transLine1->SetLineColor(kMagenta);
   transLine1->SetLineStyle(kDashed);
   transLine1->SetLineWidth(2);
   transLine1->Draw("same");
   
-  TLegend* legComb1 = new TLegend(0.65, 0.60, 0.88, 0.88);
+  TLegend* legComb1 = new TLegend(0.65, 0.55, 0.88, 0.88);
   legComb1->SetHeader("1#sigma contours");
 
   for (int w = 0; w < nWidths; ++w) {
@@ -620,12 +653,12 @@ void pid_macro_multistep_beta() {
       legComb1->AddEntry(g, Form("%s", widthLabels[w].Data()), "l");
     }
   }
-  legComb1->AddEntry(transLine1, Form("a=%.0f transition", gTransitionA), "l");
+  legComb1->AddEntry(transLine1, Form("a=%.0f (final slice)", regularMaxA), "l");
   legComb1->Draw();
   cCombined1->Modified();
   cCombined1->Update();
 
-  // --- (p, beta) plot with cuts (4x/16x and 8x/32x)
+  // --- (p, beta) plot with cuts (4x and 8x)
   TCanvas* cPBeta = new TCanvas("c_p_beta", "Momentum vs #beta with PID cuts", 1000, 800);
   cPBeta->cd();
   if (h2PB) h2PB->Draw("colz");
@@ -744,7 +777,7 @@ void pid_macro_multistep_beta() {
   cPar->cd(1);
   gPad->SetLeftMargin(0.12);
   TMultiGraph* mgMean = new TMultiGraph();
-  TLegend* legMean = new TLegend(0.60, 0.70, 0.88, 0.88);
+  TLegend* legMean = new TLegend(0.55, 0.70, 0.88, 0.88);
   for (int w = 0; w < nWidths; ++w) {
     TGraph* g = new TGraph();
     int np = 0;
@@ -753,7 +786,7 @@ void pid_macro_multistep_beta() {
         g->SetPoint(np++, allSliceCenters[w][i], allFitResults[w][i].mean);
     if (np > 0) {
       g->SetMarkerStyle(20 + w);
-      g->SetMarkerSize(0.4);
+      g->SetMarkerSize(0.5);
       g->SetMarkerColor(widthColors[w]);
       g->SetLineColor(widthColors[w]);
       mgMean->Add(g, "LP");
@@ -762,15 +795,15 @@ void pid_macro_multistep_beta() {
   }
   mgMean->SetTitle("Pion Mass vs. a;a-parameter;Mean [MeV/c^{2}]");
   mgMean->Draw("A");
-  mgMean->GetXaxis()->SetLimits(0.0, 15.0);
+  mgMean->GetXaxis()->SetLimits(0.0, 12.0);
   mgMean->GetYaxis()->SetRangeUser(120.0, 160.0);
   
-  TF1* constLine = new TF1("cl", "139.57", 0, 16);
+  TF1* constLine = new TF1("cl", "139.57", 0, 12);
   constLine->SetLineColor(kBlack);
   constLine->SetLineStyle(kDashed);
   constLine->Draw("same");
   
-  TLine* transLineMean = new TLine(gTransitionA, 120, gTransitionA, 160);
+  TLine* transLineMean = new TLine(regularMaxA, 120, regularMaxA, 160);
   transLineMean->SetLineColor(kMagenta);
   transLineMean->SetLineStyle(kDashed);
   transLineMean->Draw("same");
@@ -781,7 +814,7 @@ void pid_macro_multistep_beta() {
   cPar->cd(2);
   gPad->SetLeftMargin(0.12);
   TMultiGraph* mgSigma = new TMultiGraph();
-  TLegend* legSigma = new TLegend(0.60, 0.70, 0.88, 0.88);
+  TLegend* legSigma = new TLegend(0.55, 0.70, 0.88, 0.88);
   for (int w = 0; w < nWidths; ++w) {
     TGraph* g = new TGraph();
     int np = 0;
@@ -790,7 +823,7 @@ void pid_macro_multistep_beta() {
         g->SetPoint(np++, allSliceCenters[w][i], allFitResults[w][i].sigma);
     if (np > 0) {
       g->SetMarkerStyle(20 + w);
-      g->SetMarkerSize(0.4);
+      g->SetMarkerSize(0.5);
       g->SetMarkerColor(widthColors[w]);
       g->SetLineColor(widthColors[w]);
       mgSigma->Add(g, "LP");
@@ -799,10 +832,10 @@ void pid_macro_multistep_beta() {
   }
   mgSigma->SetTitle("Pion Width vs. a;a-parameter;#sigma [MeV/c^{2}]");
   mgSigma->Draw("A");
-  mgSigma->GetXaxis()->SetLimits(0.0, 15.0);
+  mgSigma->GetXaxis()->SetLimits(0.0, 12.0);
   mgSigma->GetYaxis()->SetRangeUser(0.0, 35.0);
   
-  TLine* transLineSigma = new TLine(gTransitionA, 0, gTransitionA, 35);
+  TLine* transLineSigma = new TLine(regularMaxA, 0, regularMaxA, 35);
   transLineSigma->SetLineColor(kMagenta);
   transLineSigma->SetLineStyle(kDashed);
   transLineSigma->Draw("same");
@@ -813,8 +846,8 @@ void pid_macro_multistep_beta() {
 
   // --- Save
   for (int w = 0; w < nWidths; ++w) {
-    cFits[w]->SaveAs(Form("pion_fits_%d.png", w));
-    cContours[w]->SaveAs(Form("pion_contours_%d.png", w));
+    cFits[w]->SaveAs(Form("pion_fits_%s.png", widthLabels[w].Data()));
+    cContours[w]->SaveAs(Form("pion_contours_%s.png", widthLabels[w].Data()));
   }
   cCombined3->SaveAs("pion_contours_combined_3sigma.png");
   cCombined1->SaveAs("pion_contours_combined_1sigma.png");
@@ -824,23 +857,28 @@ void pid_macro_multistep_beta() {
 
   // Output file
   std::ofstream outfile("pion_fit_results.txt");
-  outfile << "WidthLabel\ta-center\tWindowWidth\tMean\tSigma\tPolyOrder\tChi2NDF\tStatus" << std::endl;
+  outfile << "Width\ta-center\ta-low\ta-high\tWindowWidth\tMean\tSigma\tPolyOrder\tChi2NDF\tIsFinal\tStatus" << std::endl;
   for (int w = 0; w < nWidths; ++w) {
     for (size_t i = 0; i < allSliceCenters[w].size(); ++i) {
       FitResult& r = allFitResults[w][i];
-      outfile << widthLabels[w] << "\t" << allSliceCenters[w][i] << "\t" << r.windowWidth << "\t"
+      outfile << widthLabels[w] << "\t" << allSliceCenters[w][i] << "\t" 
+              << r.lowerBound << "\t" << r.upperBound << "\t" << r.windowWidth << "\t"
               << r.mean << "\t" << r.sigma << "\t" << r.polyOrder << "\t" << r.chi2ndf << "\t"
+              << (r.isFinalSlice ? "YES" : "NO") << "\t"
               << (r.success ? "OK" : "FAIL") << std::endl;
     }
   }
   outfile.close();
 
   cout << "\n=== Analysis Complete ===" << endl;
-  cout << "Extended range: a from " << startLower << " to " << maxUpper << endl;
-  cout << "Transition at a = " << gTransitionA << endl;
-  cout << "Width scheme: below/above transition" << endl;
-  for (int w = 0; w < nWidths; ++w) {
-    cout << "  " << widthLabels[w] << ": " << baseWidth * baseMultipliers[w] 
-         << " / " << baseWidth * highAMultipliers[w] << endl;
+  cout << "Regular fits: a = " << startLower << " to " << regularMaxA << endl;
+  cout << "Final slice: a = " << regularMaxA << " to " << finalSliceEnd << " (width = " << (finalSliceEnd - regularMaxA) << ")" << endl;
+  cout << "\nThis corresponds approximately to:" << endl;
+  double pAtRegMax, betaAtRegMax, pAtFinal, betaAtFinal;
+  if (massAToMomBeta(139.57, regularMaxA, sSquared, pAtRegMax, betaAtRegMax)) {
+    cout << "  a = " << regularMaxA << " -> p ~ " << pAtRegMax << " MeV/c, beta ~ " << betaAtRegMax << endl;
+  }
+  if (massAToMomBeta(139.57, (regularMaxA + finalSliceEnd)/2, sSquared, pAtFinal, betaAtFinal)) {
+    cout << "  Final slice center (a=" << (regularMaxA + finalSliceEnd)/2 << ") -> p ~ " << pAtFinal << " MeV/c" << endl;
   }
 }
