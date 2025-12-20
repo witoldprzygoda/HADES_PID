@@ -1,15 +1,10 @@
 // pid_macro_delta_beta.C
 // PID analysis using Δβ = β_measured - β_pion(p) representation
-// Signal pions should peak at Δβ ≈ 0
 // 
-// Coordinate system:
-//   X = momentum p [MeV/c]
-//   Y = Δβ = β_measured - p/sqrt(p² + m_π²)
-//
-// Advantages:
-//   - Signal centered at Δβ = 0 (intuitive)
-//   - Width directly reflects velocity/timing resolution
-//   - Background shape often simpler
+// IMPROVED FITTING STRATEGY:
+// 1. Pre-fit: Signal Gauss + Polynomial (no background Gauss)
+// 2. Main fit: Add background Gauss with constrained polynomial
+// 3. Parameter propagation between neighboring slices
 
 #include <iostream>
 #include <fstream>
@@ -50,24 +45,20 @@ const double gSSquared = 1e-4;    // For (mass, a) transformation
 // PHYSICS FUNCTIONS
 // =====================================================
 
-// Expected β for pion at momentum p
 double betaPion(double p) {
   return p / std::sqrt(p * p + gPionMass * gPionMass);
 }
 
-// Convert (p, Δβ) to actual β
 double deltaBetaToBeta(double p, double dBeta) {
   return betaPion(p) + dBeta;
 }
 
-// Convert (p, β) to mass
 double pBetaToMass(double p, double beta) {
   if (beta <= 0 || beta >= 1.5) return -1;
   double mass2 = p * p * (1.0 / (beta * beta) - 1.0);
   return (mass2 >= 0) ? std::sqrt(mass2) : -std::sqrt(-mass2);
 }
 
-// Convert (p, β) to (mass, a) space
 bool pBetaToMassA(double p, double beta, double s2, double& mass, double& a) {
   if (beta <= 0) return false;
   double mass2 = p * p * (1.0 / (beta * beta) - 1.0);
@@ -91,8 +82,22 @@ struct FitResult {
   double chi2ndf;
   double entries;
   double pCenter, pLow, pHigh, sliceWidth;
-  int phaseTag;       // 0=backward, 1=forward, 2=doubling
-  std::vector<double> bkgParams;  // [bkgAmp, bkgMean, bkgSigma, poly...]
+  int phaseTag;
+  // Background Gauss parameters
+  double bkgGausAmp, bkgGausMean, bkgGausSigma;
+  // Polynomial parameters
+  std::vector<double> polyParams;
+};
+
+// =====================================================
+// PROPAGATED PARAMETERS STRUCTURE
+// =====================================================
+struct PropagatedParams {
+  bool valid;
+  double sigMean, sigSigma, sigAmp;
+  double bkgAmp, bkgMean, bkgSigma;
+  std::vector<double> polyParams;
+  int polyOrder;
 };
 
 // =====================================================
@@ -150,18 +155,47 @@ std::vector<double> robustSmooth(const std::vector<double>& data, int medianWin,
   return gaussianSmooth(temp, gaussWin, gaussWin / 3.0);
 }
 
+// Sort three vectors together by the first vector (momentum)
+void sortByMomentum(std::vector<double>& p, std::vector<double>& mean, std::vector<double>& sigma) {
+  if (p.size() != mean.size() || p.size() != sigma.size()) return;
+  
+  // Create index vector
+  std::vector<size_t> indices(p.size());
+  for (size_t i = 0; i < indices.size(); ++i) indices[i] = i;
+  
+  // Sort indices by momentum
+  std::sort(indices.begin(), indices.end(), 
+            [&p](size_t a, size_t b) { return p[a] < p[b]; });
+  
+  // Reorder all three vectors
+  std::vector<double> pSorted(p.size()), meanSorted(p.size()), sigmaSorted(p.size());
+  for (size_t i = 0; i < indices.size(); ++i) {
+    pSorted[i] = p[indices[i]];
+    meanSorted[i] = mean[indices[i]];
+    sigmaSorted[i] = sigma[indices[i]];
+  }
+  
+  p = pSorted;
+  mean = meanSorted;
+  sigma = sigmaSorted;
+}
+
 // =====================================================
-// FITTING FUNCTION
+// IMPROVED FITTING FUNCTION
+// Two-stage approach:
+//   Stage 1: Signal Gauss + Polynomial (pol2, pol3, pol4) - MAIN FIT
+//   Stage 2: Add TINY background Gauss (max 5% of signal) with FIXED polynomial
 // =====================================================
 
 FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx, int widthIdx,
-                          double pCenter, double pLow, double pHigh, double sliceWidth, int phaseTag) {
+                          double pCenter, double pLow, double pHigh, double sliceWidth, int phaseTag,
+                          const PropagatedParams& prevParams) {
   FitResult best;
   best.success = false;
   best.mean = 0.0;
   best.sigma = 0.02;
   best.amplitude = 0.0;
-  best.polyOrder = 0;
+  best.polyOrder = 2;
   best.chi2ndf = 1e9;
   best.entries = proj ? proj->GetEntries() : 0;
   best.pCenter = pCenter;
@@ -169,6 +203,9 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   best.pHigh = pHigh;
   best.sliceWidth = sliceWidth;
   best.phaseTag = phaseTag;
+  best.bkgGausAmp = 0;
+  best.bkgGausMean = 0;
+  best.bkgGausSigma = 0.1;
 
   if (!proj || best.entries < 30) return best;
 
@@ -179,7 +216,6 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
 
   // =====================================================
   // Find peak position in signal region near Δβ = 0
-  // Search in [-0.05, 0.05] for the pion peak
   // =====================================================
   int bin_sig_lo = proj->FindFixBin(-0.05);
   int bin_sig_hi = proj->FindFixBin(0.05);
@@ -187,7 +223,6 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   double peakVal = -1.0;
   int peakBin = 0;
   for (int b = bin_sig_lo; b <= bin_sig_hi; ++b) {
-    // 3-bin smoothing
     double v = 0;
     int cnt = 0;
     for (int k = -1; k <= 1; ++k) {
@@ -207,7 +242,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
 
   // Background estimate from edges
   double bkgLeft = 0, bkgRight = 0;
-  int nEdgeBins = 3;
+  int nEdgeBins = 5;
   for (int b = bin_min; b < bin_min + nEdgeBins && b <= bin_max; ++b)
     bkgLeft += proj->GetBinContent(b);
   for (int b = bin_max; b > bin_max - nEdgeBins && b >= bin_min; --b)
@@ -219,183 +254,329 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   double sigAmpEst = std::max(1.0, peakVal - bkgAvg);
 
   // =====================================================
-  // Two-pass fitting: Signal Gauss + Background Gauss + Polynomial
+  // Use propagated parameters if available
   // =====================================================
+  double initSigMean = peakPos;
+  double initSigSigma = 0.015;
+  double initSigAmp = sigAmpEst;
+  
+  if (prevParams.valid) {
+    // ALWAYS use propagated signal params - they are reliable
+    initSigMean = prevParams.sigMean;
+    initSigSigma = prevParams.sigSigma;
+    // Scale amplitude by relative statistics, but keep it reasonable
+    double ampScale = integral / 1000.0;
+    initSigAmp = prevParams.sigAmp * ampScale;
+    // Ensure amplitude is reasonable
+    if (initSigAmp < 0.5) initSigAmp = sigAmpEst;
+    if (initSigAmp > 10.0 * peakVal) initSigAmp = sigAmpEst;
+    
+    // Debug: show that we're using propagated params
+    if (sliceIdx < 5 || phaseTag == 0) {  // Show for Phase 0
+      //cout << Form("    [DEBUG] Using propagated: μ=%.4f, σ=%.4f, amp=%.1f (scaled)", 
+      //             initSigMean, initSigSigma, initSigAmp) << endl;
+    }
+  }
 
-  struct PolyFitResult {
+  // =====================================================
+  // Try polynomial orders 2, 3, 4
+  // =====================================================
+  struct StageResult {
     bool valid;
+    double chi2ndf_stage1;
     double chi2ndf;
-    double mean, sigma, amplitude;
-    double bkgGausAmp, bkgGausMean, bkgGausSigma;
+    double sigMean, sigSigma, sigAmp;
+    double bkgAmp, bkgMean, bkgSigma;
     std::vector<double> polyParams;
     int polyOrder;
   };
   
+  const int polyOrders[3] = {2, 3, 4};
   const int nModels = 3;
-  PolyFitResult polyResults[nModels];
-  for (int i = 0; i < nModels; ++i) polyResults[i].valid = false;
+  StageResult results[nModels];
+  for (int i = 0; i < nModels; ++i) results[i].valid = false;
 
-  for (int polyOrder = 0; polyOrder <= 2; ++polyOrder) {
+  for (int m = 0; m < nModels; ++m) {
+    int polyOrder = polyOrders[m];
     int nPolyParams = polyOrder + 1;
-    int polyStartIdx = 6;
     
-    TString funcExpr;
-    switch (polyOrder) {
-      case 0: funcExpr = "gaus(0) + gaus(3) + [6]"; break;
-      case 1: funcExpr = "gaus(0) + gaus(3) + [6] + [7]*x"; break;
-      case 2: funcExpr = "gaus(0) + gaus(3) + [6] + [7]*x + [8]*x*x"; break;
+    // =====================================================
+    // STAGE 1: Signal Gaussian + Polynomial ONLY
+    // This is the MAIN fit - polynomial handles ALL background
+    // =====================================================
+    TString funcExpr1 = "gaus(0)";
+    for (int pp = 0; pp <= polyOrder; ++pp) {
+      if (pp == 0) funcExpr1 += Form(" + [%d]", 3 + pp);
+      else funcExpr1 += Form(" + [%d]*pow(x,%d)", 3 + pp, pp);
+    }
+    
+    TString funcName1 = Form("stage1_w%d_s%d_p%d", widthIdx, sliceIdx, polyOrder);
+    TF1* stage1Fit = new TF1(funcName1, funcExpr1, fitMin, fitMax);
+    
+    // Signal Gaussian
+    stage1Fit->SetParameter(0, initSigAmp);
+    stage1Fit->SetParameter(1, initSigMean);
+    stage1Fit->SetParameter(2, initSigSigma);
+    stage1Fit->SetParLimits(0, 0.1, std::max(10.0, 5.0 * peakVal));
+    stage1Fit->SetParLimits(1, -0.04, 0.04);
+    stage1Fit->SetParLimits(2, 0.003, 0.06);
+    
+    // Polynomial initialization - ALWAYS use propagated params as base
+    if (prevParams.valid && prevParams.polyParams.size() > 0) {
+      // Use propagated polynomial params as starting point
+      // Copy what we can from previous fit
+      stage1Fit->SetParameter(3, prevParams.polyParams[0]);  // constant
+      if (polyOrder >= 1 && prevParams.polyParams.size() > 1) 
+        stage1Fit->SetParameter(4, prevParams.polyParams[1]);
+      else if (polyOrder >= 1)
+        stage1Fit->SetParameter(4, 0.0);
+      if (polyOrder >= 2 && prevParams.polyParams.size() > 2) 
+        stage1Fit->SetParameter(5, prevParams.polyParams[2]);
+      else if (polyOrder >= 2)
+        stage1Fit->SetParameter(5, 0.0);
+      if (polyOrder >= 3 && prevParams.polyParams.size() > 3) 
+        stage1Fit->SetParameter(6, prevParams.polyParams[3]);
+      else if (polyOrder >= 3)
+        stage1Fit->SetParameter(6, 0.0);
+      if (polyOrder >= 4 && prevParams.polyParams.size() > 4) 
+        stage1Fit->SetParameter(7, prevParams.polyParams[4]);
+      else if (polyOrder >= 4)
+        stage1Fit->SetParameter(7, 0.0);
+    } else {
+      // No propagated params - use defaults
+      stage1Fit->SetParameter(3, std::max(0.1, bkgAvg));
+      double slope = (bkgRight - bkgLeft) / (fitMax - fitMin);
+      if (polyOrder >= 1) stage1Fit->SetParameter(4, slope);
+      if (polyOrder >= 2) stage1Fit->SetParameter(5, 0.0);
+      if (polyOrder >= 3) stage1Fit->SetParameter(6, 0.0);
+      if (polyOrder >= 4) stage1Fit->SetParameter(7, 0.0);
+    }
+
+    TFitResultPtr res1 = proj->Fit(stage1Fit, "SQR0B");
+    
+    if (!res1.Get() || !res1->IsValid() || res1->Status() != 0) {
+      delete stage1Fit;
+      continue;
+    }
+    
+    // Extract Stage 1 results
+    double s1_sigAmp = stage1Fit->GetParameter(0);
+    double s1_sigMean = stage1Fit->GetParameter(1);
+    double s1_sigSigma = stage1Fit->GetParameter(2);
+    std::vector<double> s1_poly;
+    for (int pp = 0; pp < nPolyParams; ++pp)
+      s1_poly.push_back(stage1Fit->GetParameter(3 + pp));
+    
+    double s1_chi2ndf = (res1->Ndf() > 0) ? res1->Chi2() / res1->Ndf() : 1e6;
+    
+    delete stage1Fit;
+    
+    // Skip if Stage 1 fit is terrible
+    if (s1_chi2ndf > 15.0) {
+      if (phaseTag == 0) cout << Form("      [pol%d Stage1 chi2=%.1f > 15]", polyOrder, s1_chi2ndf) << endl;
+      continue;
+    }
+    
+    // Basic validation of Stage 1 - relaxed for wider windows
+    double s1MeanRange = (sliceWidth > 50) ? 0.06 : 0.05;
+    double s1AlignTol = (sliceWidth > 50) ? 0.04 : 0.03;
+    
+    if (s1_sigMean < -s1MeanRange || s1_sigMean > s1MeanRange) {
+      if (phaseTag == 0) cout << Form("      [pol%d Stage1 mean=%.4f out of range ±%.2f]", polyOrder, s1_sigMean, s1MeanRange) << endl;
+      continue;
+    }
+    if (s1_sigSigma < 0.003 || s1_sigSigma > 0.08) {
+      if (phaseTag == 0) cout << Form("      [pol%d Stage1 sigma=%.4f out of range]", polyOrder, s1_sigSigma) << endl;
+      continue;
+    }
+    if (std::abs(s1_sigMean - peakPos) > s1AlignTol) {
+      if (phaseTag == 0) cout << Form("      [pol%d Stage1 peakAlign |%.4f-%.4f|=%.4f > %.3f]", 
+                                       polyOrder, s1_sigMean, peakPos, std::abs(s1_sigMean - peakPos), s1AlignTol) << endl;
+      continue;
     }
 
     // =====================================================
-    // PASS 1: Fix signal mean to peak position
+    // STAGE 2: Add TINY Background Gaussian
+    // - Polynomial parameters are COMPLETELY FIXED
+    // - Background Gauss amplitude limited to 5% of signal
+    // - This is just fine-tuning, should barely change anything
     // =====================================================
-    TString funcName1 = Form("fit1_w%d_s%d_p%d", widthIdx, sliceIdx, polyOrder);
-    TF1* fitFunc1 = new TF1(funcName1, funcExpr, fitMin, fitMax);
     
-    // Signal Gaussian - mean fixed near peak
-    fitFunc1->SetParameter(0, sigAmpEst);
-    fitFunc1->SetParameter(1, peakPos);
-    fitFunc1->SetParameter(2, 0.015);  // Initial sigma ~0.015
-    fitFunc1->SetParLimits(0, 0.1, std::max(10.0, 5.0 * peakVal));
-    fitFunc1->FixParameter(1, peakPos);
-    fitFunc1->SetParLimits(2, 0.005, 0.08);  // σ between 0.005 and 0.08
+    // Build expression: gaus(0) + gaus(3) + poly starting at [6]
+    TString funcExpr2 = "gaus(0) + gaus(3)";
+    for (int pp = 0; pp <= polyOrder; ++pp) {
+      if (pp == 0) funcExpr2 += Form(" + [%d]", 6 + pp);
+      else funcExpr2 += Form(" + [%d]*pow(x,%d)", 6 + pp, pp);
+    }
     
-    // Background Gaussian - broad, can be displaced
-    fitFunc1->SetParameter(3, std::max(0.5, bkgAvg * 0.3));
-    fitFunc1->SetParameter(4, 0.05);  // Start displaced
-    fitFunc1->SetParameter(5, 0.08);  // Broad
-    fitFunc1->SetParLimits(3, 0.0, std::max(10.0, 2.0 * peakVal));
-    fitFunc1->SetParLimits(4, fitMin + 0.01, fitMax - 0.01);
-    fitFunc1->SetParLimits(5, 0.04, 0.2);  // Background wider than signal
+    TString funcName2 = Form("stage2_w%d_s%d_p%d", widthIdx, sliceIdx, polyOrder);
+    TF1* stage2Fit = new TF1(funcName2, funcExpr2, fitMin, fitMax);
     
-    // Polynomial
-    fitFunc1->SetParameter(polyStartIdx, std::max(0.1, bkgAvg * 0.2));
-    for (int pp = 1; pp < nPolyParams; ++pp)
-      fitFunc1->SetParameter(polyStartIdx + pp, 0.0);
-
-    TFitResultPtr result1 = proj->Fit(fitFunc1, "SQR0B");
+    // Signal Gaussian - very tight constraints around Stage 1
+    stage2Fit->SetParameter(0, s1_sigAmp);
+    stage2Fit->SetParameter(1, s1_sigMean);
+    stage2Fit->SetParameter(2, s1_sigSigma);
+    // Allow only ±10% variation
+    stage2Fit->SetParLimits(0, s1_sigAmp * 0.9, s1_sigAmp * 1.1);
+    stage2Fit->SetParLimits(1, s1_sigMean - 0.005, s1_sigMean + 0.005);
+    stage2Fit->SetParLimits(2, s1_sigSigma * 0.9, s1_sigSigma * 1.1);
     
-    double pass1_sigAmp = fitFunc1->GetParameter(0);
-    double pass1_sigSigma = fitFunc1->GetParameter(2);
-    double pass1_bkgAmp = fitFunc1->GetParameter(3);
-    double pass1_bkgMean = fitFunc1->GetParameter(4);
-    double pass1_bkgSigma = fitFunc1->GetParameter(5);
-    std::vector<double> pass1_poly;
-    for (int pp = 0; pp < nPolyParams; ++pp)
-      pass1_poly.push_back(fitFunc1->GetParameter(polyStartIdx + pp));
-
-    delete fitFunc1;
-
-    // =====================================================
-    // PASS 2: Allow signal mean to vary within ±0.02 of peak
-    // =====================================================
-    TString funcName2 = Form("fit2_w%d_s%d_p%d", widthIdx, sliceIdx, polyOrder);
-    TF1* fitFunc2 = new TF1(funcName2, funcExpr, fitMin, fitMax);
+    // Background Gaussian - EXTREMELY SMALL correction
+    // Maximum amplitude: 5% of signal amplitude
+    double maxBkgAmp = 0.05 * s1_sigAmp;
+    stage2Fit->SetParameter(3, 0.02 * s1_sigAmp);  // Start at 2%
+    stage2Fit->SetParLimits(3, 0.0, maxBkgAmp);
     
-    fitFunc2->SetParameter(0, pass1_sigAmp);
-    fitFunc2->SetParameter(1, peakPos);
-    fitFunc2->SetParameter(2, pass1_sigSigma);
-    fitFunc2->SetParLimits(0, 0.1, std::max(10.0, 5.0 * peakVal));
-    // Allow mean to vary within ±0.02 of peak
-    double meanLo = std::max(-0.05, peakPos - 0.02);
-    double meanHi = std::min(0.05, peakPos + 0.02);
-    fitFunc2->SetParLimits(1, meanLo, meanHi);
-    fitFunc2->SetParLimits(2, 0.005, 0.08);
+    // Background Gaussian mean - away from signal
+    stage2Fit->SetParameter(4, 0.05);
+    stage2Fit->SetParLimits(4, 0.02, 0.10);
     
-    fitFunc2->SetParameter(3, pass1_bkgAmp);
-    fitFunc2->SetParameter(4, pass1_bkgMean);
-    fitFunc2->SetParameter(5, pass1_bkgSigma);
-    fitFunc2->SetParLimits(3, 0.0, std::max(10.0, 2.0 * peakVal));
-    fitFunc2->SetParLimits(4, fitMin + 0.01, fitMax - 0.01);
-    fitFunc2->SetParLimits(5, 0.04, 0.2);
+    // Background Gaussian sigma - broad
+    stage2Fit->SetParameter(5, 0.06);
+    stage2Fit->SetParLimits(5, 0.04, 0.10);
     
-    for (int pp = 0; pp < nPolyParams; ++pp)
-      fitFunc2->SetParameter(polyStartIdx + pp, pass1_poly[pp]);
+    // Polynomial - COMPLETELY FIXED from Stage 1
+    for (int pp = 0; pp < nPolyParams; ++pp) {
+      stage2Fit->SetParameter(6 + pp, s1_poly[pp]);
+      stage2Fit->FixParameter(6 + pp, s1_poly[pp]);  // FIXED!
+    }
 
-    TFitResultPtr result2 = proj->Fit(fitFunc2, "SQR0B");
-
-    if (result2.Get() && result2->IsValid() && result2->Status() == 0) {
-      double fMean = fitFunc2->GetParameter(1);
-      double fSigma = fitFunc2->GetParameter(2);
-      double fAmp = fitFunc2->GetParameter(0);
-      double bkgAmp = fitFunc2->GetParameter(3);
-      double bkgSigma = fitFunc2->GetParameter(5);
-      int ndf = result2->Ndf();
-      double chi2 = result2->Chi2();
-      double chi2ndf = (ndf > 0) ? chi2 / ndf : 1e6;
-
-      bool sigmaOK = (fSigma < bkgSigma * 0.9);
-      bool meanOK = (fMean > -0.05 && fMean < 0.05);
-      bool ampOK = (fAmp > 0.1);
-      bool chi2OK = (chi2ndf > 0.1 && chi2ndf < 100.0);
-      bool peakAligned = (std::abs(fMean - peakPos) < 0.03);
-      bool ampRatioOK = (fAmp >= bkgAmp * 0.8);
-
-      if (sigmaOK && meanOK && ampOK && chi2OK && peakAligned && ampRatioOK) {
-        polyResults[polyOrder].valid = true;
-        polyResults[polyOrder].chi2ndf = chi2ndf;
-        polyResults[polyOrder].mean = fMean;
-        polyResults[polyOrder].sigma = fSigma;
-        polyResults[polyOrder].amplitude = fAmp;
-        polyResults[polyOrder].bkgGausAmp = bkgAmp;
-        polyResults[polyOrder].bkgGausMean = fitFunc2->GetParameter(4);
-        polyResults[polyOrder].bkgGausSigma = bkgSigma;
-        polyResults[polyOrder].polyOrder = polyOrder;
-        polyResults[polyOrder].polyParams.clear();
-        for (int pp = 0; pp < nPolyParams; ++pp)
-          polyResults[polyOrder].polyParams.push_back(fitFunc2->GetParameter(polyStartIdx + pp));
+    TFitResultPtr res2 = proj->Fit(stage2Fit, "SQR0B");
+    
+    bool stage2OK = false;
+    double s2_sigAmp = s1_sigAmp;
+    double s2_sigMean = s1_sigMean;
+    double s2_sigSigma = s1_sigSigma;
+    double s2_bkgAmp = 0;
+    double s2_bkgMean = 0.05;
+    double s2_bkgSigma = 0.06;
+    double s2_chi2ndf = s1_chi2ndf;
+    
+    if (res2.Get() && res2->IsValid() && res2->Status() == 0) {
+      s2_sigAmp = stage2Fit->GetParameter(0);
+      s2_sigMean = stage2Fit->GetParameter(1);
+      s2_sigSigma = stage2Fit->GetParameter(2);
+      s2_bkgAmp = stage2Fit->GetParameter(3);
+      s2_bkgMean = stage2Fit->GetParameter(4);
+      s2_bkgSigma = stage2Fit->GetParameter(5);
+      int ndf = res2->Ndf();
+      double chi2 = res2->Chi2();
+      s2_chi2ndf = (ndf > 0) ? chi2 / ndf : s1_chi2ndf;
+      
+      // Check if Stage 2 improved the fit (or at least didn't make it worse)
+      if (s2_chi2ndf <= s1_chi2ndf * 1.1) {
+        stage2OK = true;
       }
     }
+    
+    delete stage2Fit;
+    
+    // If Stage 2 failed or made things worse, use Stage 1 results with bkgAmp=0
+    if (!stage2OK) {
+      s2_sigAmp = s1_sigAmp;
+      s2_sigMean = s1_sigMean;
+      s2_sigSigma = s1_sigSigma;
+      s2_bkgAmp = 0;
+      s2_chi2ndf = s1_chi2ndf;
+    }
+    
+    // Final validation - relaxed for wider windows
+    bool sigmaOK = (s2_sigSigma > 0.003 && s2_sigSigma < 0.08);  // Wider sigma allowed
+    bool meanOK = (s2_sigMean > -0.05 && s2_sigMean < 0.05);     // Slightly wider mean range
+    bool ampOK = (s2_sigAmp > 0.3);                               // Lower amp threshold
+    bool chi2OK = (s2_chi2ndf > 0.02 && s2_chi2ndf < 30.0);      // Wider chi2 range
+    // Relax peakAligned for wider windows (Phase 0 extended slices)
+    double alignTol = 0.03;  // Base tolerance
+    if (sliceWidth > 50) alignTol = 0.05;  // More tolerance for wide windows
+    bool peakAligned = (std::abs(s2_sigMean - peakPos) < alignTol);
 
-    delete fitFunc2;
+    // Debug output for Phase 0 failures
+    if (phaseTag == 0 && !(sigmaOK && meanOK && ampOK && chi2OK && peakAligned)) {
+      cout << Form("      [pol%d FAIL] μ=%.4f(OK:%d), σ=%.4f(OK:%d), A=%.1f(OK:%d), χ²=%.2f(OK:%d), align=%.3f(OK:%d)",
+                   polyOrder, s2_sigMean, meanOK, s2_sigSigma, sigmaOK, s2_sigAmp, ampOK, 
+                   s2_chi2ndf, chi2OK, std::abs(s2_sigMean - peakPos), peakAligned) << endl;
+    }
+
+    if (sigmaOK && meanOK && ampOK && chi2OK && peakAligned) {
+      results[m].valid = true;
+      results[m].chi2ndf_stage1 = s1_chi2ndf;
+      results[m].chi2ndf = s2_chi2ndf;
+      results[m].sigMean = s2_sigMean;
+      results[m].sigSigma = s2_sigSigma;
+      results[m].sigAmp = s2_sigAmp;
+      results[m].bkgAmp = s2_bkgAmp;
+      results[m].bkgMean = s2_bkgMean;
+      results[m].bkgSigma = s2_bkgSigma;
+      results[m].polyOrder = polyOrder;
+      results[m].polyParams = s1_poly;  // Always use Stage 1 polynomial
+    }
   }
 
-  // Select best model
-  const double chi2ndf_good_min = 0.5;
-  const double chi2ndf_good_max = 3.0;
+  // =====================================================
+  // Select best model - prefer simpler polynomial if chi2 OK
+  // =====================================================
+  const double chi2_good_min = 0.3;
+  const double chi2_good_max = 3.0;
   
-  int bestOrder = -1;
+  int bestIdx = -1;
   double bestScore = 1e9;
   
-  for (int po = 0; po < nModels; ++po) {
-    if (polyResults[po].valid) {
-      double c = polyResults[po].chi2ndf;
-      if (c >= chi2ndf_good_min && c <= chi2ndf_good_max) {
-        bestOrder = po;
+  // First: find simplest model with good chi2
+  for (int m = 0; m < nModels; ++m) {
+    if (results[m].valid) {
+      double c = results[m].chi2ndf;
+      if (c >= chi2_good_min && c <= chi2_good_max) {
+        bestIdx = m;
         break;
       }
     }
   }
   
-  if (bestOrder < 0) {
-    for (int po = 0; po < nModels; ++po) {
-      if (polyResults[po].valid) {
-        double c = polyResults[po].chi2ndf;
-        double score = std::abs(std::log(c)) + 0.1 * po;
+  // Fallback: use scoring
+  if (bestIdx < 0) {
+    for (int m = 0; m < nModels; ++m) {
+      if (results[m].valid) {
+        double c = results[m].chi2ndf;
+        double score = std::abs(std::log(c)) + 0.1 * (polyOrders[m] - 2);
         if (score < bestScore) {
           bestScore = score;
-          bestOrder = po;
+          bestIdx = m;
         }
       }
     }
   }
   
-  if (bestOrder >= 0) {
+  if (bestIdx >= 0) {
     best.success = true;
-    best.mean = polyResults[bestOrder].mean;
-    best.sigma = polyResults[bestOrder].sigma;
-    best.amplitude = polyResults[bestOrder].amplitude;
-    best.polyOrder = polyResults[bestOrder].polyOrder;
-    best.chi2ndf = polyResults[bestOrder].chi2ndf;
-    best.bkgParams.clear();
-    best.bkgParams.push_back(polyResults[bestOrder].bkgGausAmp);
-    best.bkgParams.push_back(polyResults[bestOrder].bkgGausMean);
-    best.bkgParams.push_back(polyResults[bestOrder].bkgGausSigma);
-    for (size_t pp = 0; pp < polyResults[bestOrder].polyParams.size(); ++pp)
-      best.bkgParams.push_back(polyResults[bestOrder].polyParams[pp]);
+    best.mean = results[bestIdx].sigMean;
+    best.sigma = results[bestIdx].sigSigma;
+    best.amplitude = results[bestIdx].sigAmp;
+    best.polyOrder = results[bestIdx].polyOrder;
+    best.chi2ndf = results[bestIdx].chi2ndf;
+    best.bkgGausAmp = results[bestIdx].bkgAmp;
+    best.bkgGausMean = results[bestIdx].bkgMean;
+    best.bkgGausSigma = results[bestIdx].bkgSigma;
+    best.polyParams = results[bestIdx].polyParams;
   }
 
   return best;
+}
+
+// Convert FitResult to PropagatedParams
+PropagatedParams fitResultToProps(const FitResult& r) {
+  PropagatedParams p;
+  p.valid = r.success;
+  if (r.success) {
+    p.sigMean = r.mean;
+    p.sigSigma = r.sigma;
+    p.sigAmp = r.amplitude;
+    p.bkgAmp = r.bkgGausAmp;
+    p.bkgMean = r.bkgGausMean;
+    p.bkgSigma = r.bkgGausSigma;
+    p.polyParams = r.polyParams;
+    p.polyOrder = r.polyOrder;
+  }
+  return p;
 }
 
 // =====================================================
@@ -408,12 +589,11 @@ void pid_macro_multistep_beta() {
   gStyle->SetOptFit(111);
 
   // --- Build TChain
-  const char* treeName = "PimEpEm";
+  const char* treeName = "PimEpEm_ID";
   const std::vector<TString> files = {
-    "pp060_Sept2025.root", "pp049.root"
-    //"pp060_01_exp.root","pp060_02_exp.root","pp060_03_exp.root",
-    //"pp060_04_exp.root","pp060_05_exp.root","pp060_06_exp.root",
-    //"pp060_07_exp.root","pp060_08_exp.root","pp060_09_exp.root", "pp060_10_exp.root"
+    "pp060_01_exp.root","pp060_02_exp.root","pp060_03_exp.root",
+    "pp060_04_exp.root","pp060_05_exp.root","pp060_06_exp.root",
+    "pp060_07_exp.root","pp060_08_exp.root","pp060_09_exp.root", "pp060_10_exp.root"
   };
   TChain* chain = new TChain(treeName);
   int added = 0;
@@ -433,14 +613,11 @@ void pid_macro_multistep_beta() {
   cout << "TChain: " << added << " files, " << nEnt << " entries" << endl;
 
   // =====================================================
-  // CREATE 2D HISTOGRAM: p vs Δβ
-  // Δβ = β_measured - β_pion(p)
-  // β_pion(p) = p / sqrt(p² + m_π²)
+  // CREATE 2D HISTOGRAMS
   // =====================================================
   
+  // Main histogram: p vs Δβ
   const char* h2name = "h2_p_deltaBeta";
-  // Y-axis: Δβ from -0.15 to 0.15, 300 bins
-  // X-axis: p from 0 to 1400 MeV/c, 280 bins
   TString drawCmd = Form(
     "pim_beta - pim_p/sqrt(pim_p*pim_p + %.2f*%.2f) : pim_p >> %s(280,0,1400,300,-0.15,0.15)",
     gPionMass, gPionMass, h2name);
@@ -457,13 +634,13 @@ void pid_macro_multistep_beta() {
   h2DB->GetXaxis()->SetTitle("Momentum [MeV/c]");
   h2DB->GetYaxis()->SetTitle("#Delta#beta = #beta - #beta_{#pi}");
 
-  // Also create (p, β) histogram for display
+  // (p, β) histogram
   const char* h2pb_name = "h2_p_beta";
   if (gDirectory->FindObject(h2pb_name)) gDirectory->Delete(Form("%s;*", h2pb_name));
   chain->Draw(Form("pim_beta : pim_p >> %s(280,0,1400,300,0.3,1.15)", h2pb_name), "isBest==1", "colz");
   TH2F* h2PB = static_cast<TH2F*>(gDirectory->Get(h2pb_name));
 
-  // And (mass, a) histogram
+  // (mass, a) histogram
   const char* h2ma_name = "h2_mass_a";
   TString drawMA = Form(
     "sqrt(1 + %.1e*pim_p*pim_p - pow(1-pim_beta*pim_beta,2)) : "
@@ -473,30 +650,41 @@ void pid_macro_multistep_beta() {
   chain->Draw(drawMA, "isBest==1 && pim_beta>0 && pim_beta<1", "colz");
   TH2F* h2MA = static_cast<TH2F*>(gDirectory->Get(h2ma_name));
 
+  // (p, mass²) histogram - mass² = p² * (1/β² - 1)
+  const char* h2m2_name = "h2_p_mass2";
+  if (gDirectory->FindObject(h2m2_name)) gDirectory->Delete(Form("%s;*", h2m2_name));
+  chain->Draw(Form("pim_p*pim_p*(1.0/(pim_beta*pim_beta) - 1) : pim_p >> %s(280,0,1400,400,-20000,60000)", h2m2_name), 
+              "isBest==1 && pim_beta>0.1 && pim_beta<1.5", "colz");
+  TH2F* h2M2 = static_cast<TH2F*>(gDirectory->Get(h2m2_name));
+  if (h2M2) {
+    h2M2->SetTitle("Mass^{2} vs Momentum");
+    h2M2->GetXaxis()->SetTitle("Momentum [MeV/c]");
+    h2M2->GetYaxis()->SetTitle("Mass^{2} [MeV^{2}/c^{4}]");
+  }
+
   // =====================================================
-  // THREE-PHASE SCANNING PARAMETERS
+  // SCANNING PARAMETERS
   // =====================================================
   
-  const double startMom = 120.0;
-  const double transitionMom = 500.0;
+  const double warmupLow = 200.0;       // Warmup fit range [200, 400] - always good
+  const double warmupHigh = 400.0;
+  const double startMom = 180.0;        // Anchor point for regular fitting
+  const double transitionMom = 500.0;   // Where doubling starts
   const double endMom = 1400.0;
-  const double stepSize = 1.0;
+  const double stepSize = 1.0;          // 1 MeV/c steps in Phase 1
   
   const int nWidths = 4;
   const double baseWidths[nWidths] = {5.0, 10.0, 20.0, 40.0};
   const TString widthLabels[nWidths] = {"1x(5)", "2x(10)", "4x(20)", "8x(40)"};
   const int widthColors[nWidths] = {kBlue, kRed, kGreen+2, kMagenta};
 
-  // Fit range in Δβ
   const double fitRangeMin = -0.12;
   const double fitRangeMax = 0.12;
 
-  // Storage
   std::vector<std::vector<FitResult>> allFitResults(nWidths);
   std::vector<std::vector<double>> allMomCenters(nWidths);
 
-  // Canvas array
-  TCanvas* cFits[nWidths];
+  TCanvas* cFits[4];  // 4 widths now
   const int nDisplayPerWidth = 12;
 
   // =====================================================
@@ -509,115 +697,193 @@ void pid_macro_multistep_beta() {
     cout << "=== Width " << widthLabels[w] << " (base=" << baseW << " MeV/c) ===" << endl;
     cout << "=============================================" << endl;
 
-    // Build slice list
+    // =====================================================
+    // BUILD ALL SLICES
+    // Phase 0: backward - RIGHT EDGE ANCHORED at 180, extend left
+    //          [175, 180], [170, 180], ..., [0, 180]
+    // Phase 1: forward from startMom with fixed width (sliding)
+    // Phase 2: forward from transitionMom with doubling width
+    // =====================================================
+    
     std::vector<double> momLows, momHighs, momCenters, sliceWidths;
     std::vector<int> phaseTag;
 
-    // Phase 0: backward (right edge anchored at startMom)
-    cout << "=== Phase 0: Backward from " << startMom << " MeV/c" << endl;
+    // Phase 0: Right edge anchored at startMom, extend left edge
+    // First slice: [180-baseW, 180], then [180-2*baseW, 180], etc.
+    std::vector<int> phase0Indices;
     {
-      double pRight = startMom;
+      double pRight = startMom;  // Always 180
       double pLeft = startMom - baseW;
+      
       while (pLeft >= 0) {
+        int idx = momLows.size();
         momLows.push_back(pLeft);
-        momHighs.push_back(pRight);
+        momHighs.push_back(pRight);  // Always startMom (180)
         momCenters.push_back(0.5 * (pLeft + pRight));
         sliceWidths.push_back(pRight - pLeft);
         phaseTag.push_back(0);
+        phase0Indices.push_back(idx);
+        
+        // Extend left edge by baseW for next slice (width grows)
         pLeft -= baseW;
       }
-      // Add final slice from 0 to wherever we are
-      if (momLows.back() > 0) {
+      
+      // Final slice from 0 to startMom if not already there
+      if (momLows.empty() || momLows.back() > 0) {
+        int idx = momLows.size();
         momLows.push_back(0);
-        momHighs.push_back(pRight);
+        momHighs.push_back(pRight);  // 180
         momCenters.push_back(0.5 * pRight);
         sliceWidths.push_back(pRight);
         phaseTag.push_back(0);
+        phase0Indices.push_back(idx);
       }
-      std::reverse(momLows.begin(), momLows.end());
-      std::reverse(momHighs.begin(), momHighs.end());
-      std::reverse(momCenters.begin(), momCenters.end());
-      std::reverse(sliceWidths.begin(), sliceWidths.end());
-      std::reverse(phaseTag.begin(), phaseTag.end());
     }
-    int nPhase0 = momLows.size();
-    cout << "Phase 0: " << nPhase0 << " slices" << endl;
+    int nPhase0 = phase0Indices.size();
 
-    // Phase 1: forward fixed width
-    cout << "=== Phase 1: Forward " << startMom << " to " << transitionMom << " MeV/c" << endl;
-    int nPhase1 = 0;
+    // Phase 1: forward sliding slices from startMom
+    std::vector<int> phase1Indices;
     {
       double pLeft = startMom;
       while (pLeft < transitionMom) {
+        int idx = momLows.size();
         momLows.push_back(pLeft);
         momHighs.push_back(pLeft + baseW);
         momCenters.push_back(pLeft + 0.5 * baseW);
         sliceWidths.push_back(baseW);
         phaseTag.push_back(1);
+        phase1Indices.push_back(idx);
         pLeft += stepSize;
-        nPhase1++;
       }
     }
-    cout << "Phase 1: " << nPhase1 << " slices" << endl;
+    int nPhase1 = phase1Indices.size();
 
-    // Phase 2: doubling width
-    cout << "=== Phase 2: Doubling from " << transitionMom << " MeV/c" << endl;
-    int nPhase2 = 0;
+    // Phase 2: doubling width from transitionMom
+    std::vector<int> phase2Indices;
     {
       double pLeft = transitionMom;
       double currentWidth = baseW;
       while (pLeft < endMom) {
         double pRight = std::min(pLeft + currentWidth, endMom);
+        int idx = momLows.size();
         momLows.push_back(pLeft);
         momHighs.push_back(pRight);
         momCenters.push_back(0.5 * (pLeft + pRight));
         sliceWidths.push_back(pRight - pLeft);
         phaseTag.push_back(2);
-        cout << "  Step " << nPhase2 << ": p=[" << pLeft << ", " << pRight << "], w=" << currentWidth << endl;
+        phase2Indices.push_back(idx);
         pLeft = pRight;
         currentWidth *= 2.0;
-        nPhase2++;
       }
     }
-    cout << "Phase 2: " << nPhase2 << " slices" << endl;
+    int nPhase2 = phase2Indices.size();
 
     int nSlices = momLows.size();
-    cout << "Total slices: " << nSlices << endl;
+    
+    // Print Phase 0 slice structure
+    cout << "Phase 0 slices (right edge anchored at " << startMom << "):" << endl;
+    for (size_t k = 0; k < phase0Indices.size(); ++k) {
+      int idx = phase0Indices[k];
+      if (k < 5 || k >= phase0Indices.size() - 2) {
+        cout << Form("  [%3.0f, %3.0f] width=%3.0f", 
+                     momLows[idx], momHighs[idx], sliceWidths[idx]) << endl;
+      } else if (k == 5) {
+        cout << "  ..." << endl;
+      }
+    }
+    
+    cout << "Slices: Phase0=" << nPhase0 << " (backward, anchored), Phase1=" << nPhase1 
+         << " (forward), Phase2=" << nPhase2 << " (doubling), Total=" << nSlices << endl;
 
     allMomCenters[w] = momCenters;
     allFitResults[w].resize(nSlices);
 
-    // Select display indices
-    std::vector<int> displayIndices;
-    // From Phase 0: first, middle, last
-    if (nPhase0 > 0) {
-      displayIndices.push_back(0);
-      displayIndices.push_back(nPhase0 / 2);
-      displayIndices.push_back(nPhase0 - 1);
-    }
-    // From Phase 1: evenly spaced
-    for (int k = 0; k < 5 && k * nPhase1 / 5 < nPhase1; ++k) {
-      int idx = nPhase0 + k * nPhase1 / 5;
-      displayIndices.push_back(idx);
-    }
-    // From Phase 2: all
-    for (int k = 0; k < nPhase2 && k < 4; ++k) {
-      displayIndices.push_back(nPhase0 + nPhase1 + k);
-    }
-    // Remove duplicates and sort
-    std::sort(displayIndices.begin(), displayIndices.end());
-    displayIndices.erase(std::unique(displayIndices.begin(), displayIndices.end()), displayIndices.end());
-    if (displayIndices.size() > (size_t)nDisplayPerWidth)
-      displayIndices.resize(nDisplayPerWidth);
-
-    // Create canvas
-    cFits[w] = new TCanvas(Form("c_fits_dBeta_%d", w), 
-                           Form("Delta-Beta Fits - %s", widthLabels[w].Data()), 1400, 900);
-    cFits[w]->Divide(4, 3);
-
-    // Fit all slices
+    // =====================================================
+    // FIT IN CORRECT ORDER:
+    // 0. WARMUP: [200, 400] - fixed range, always good, get initial params
+    // 1. First slice of Phase 1 [180, 180+baseW] - use warmup params
+    // 2. Phase 0: use anchor params, fit [175,180], [170,180], ..., [0,180]
+    // 3. Rest of Phase 1 forward
+    // 4. Phase 2 forward
+    // =====================================================
+    
     int nSuccess = 0;
-    for (int i = 0; i < nSlices; ++i) {
+    PropagatedParams warmupParams;
+    warmupParams.valid = false;
+    PropagatedParams anchorParams;
+    anchorParams.valid = false;
+    
+    // Step 0: WARMUP FIT [180, 250] - this always works well!
+    cout << "Fitting WARMUP [" << warmupLow << "," << warmupHigh << "] (fixed range, always good)..." << endl;
+    {
+      int xbin_lo = h2DB->GetXaxis()->FindFixBin(warmupLow + 0.01);
+      int xbin_hi = h2DB->GetXaxis()->FindFixBin(warmupHigh - 0.01);
+      
+      TString projName = Form("proj_db_w%d_warmup", w);
+      if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
+      TH1D* proj = h2DB->ProjectionY(projName, xbin_lo, xbin_hi, "e");
+      
+      PropagatedParams noParams;
+      noParams.valid = false;
+      
+      // Use special warmup parameters - this is a wide, high-statistics slice
+      double warmupCenter = 0.5 * (warmupLow + warmupHigh);
+      double warmupWidth = warmupHigh - warmupLow;
+      
+      FitResult warmupResult = tryFitDeltaBeta(proj, fitRangeMin, fitRangeMax, -1, w,
+                                                warmupCenter, warmupLow, warmupHigh, 
+                                                warmupWidth, -1, noParams);  // phaseTag=-1 for warmup
+      delete proj;
+      
+      if (warmupResult.success) {
+        warmupParams = fitResultToProps(warmupResult);
+        cout << Form("  WARMUP OK: μ=%.4f, σ=%.4f, χ²=%.2f (will use for all fits)", 
+                     warmupResult.mean, warmupResult.sigma, warmupResult.chi2ndf) << endl;
+      } else {
+        cout << "  WARMUP FAILED! Will try fitting without initial params." << endl;
+      }
+    }
+    
+    // Step 1: Fit ANCHOR from Phase 1 [180, 180+baseW] using warmup params
+    if (!phase1Indices.empty()) {
+      int anchorIdx = phase1Indices[0];
+      cout << "Fitting ANCHOR [" << momLows[anchorIdx] << "," << momHighs[anchorIdx] 
+           << "] using warmup params..." << endl;
+      
+      int xbin_lo = h2DB->GetXaxis()->FindFixBin(momLows[anchorIdx] + 0.01);
+      int xbin_hi = h2DB->GetXaxis()->FindFixBin(momHighs[anchorIdx] - 0.01);
+      
+      TString projName = Form("proj_db_w%d_anchor", w);
+      if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
+      TH1D* proj = h2DB->ProjectionY(projName, xbin_lo, xbin_hi, "e");
+      
+      // Use warmup params as starting point
+      allFitResults[w][anchorIdx] = tryFitDeltaBeta(proj, fitRangeMin, fitRangeMax, anchorIdx, w,
+                                                     momCenters[anchorIdx], momLows[anchorIdx], 
+                                                     momHighs[anchorIdx], sliceWidths[anchorIdx], 
+                                                     phaseTag[anchorIdx], warmupParams);
+      delete proj;
+      
+      if (allFitResults[w][anchorIdx].success) {
+        nSuccess++;
+        anchorParams = fitResultToProps(allFitResults[w][anchorIdx]);
+        cout << Form("  ANCHOR OK: μ=%.4f, σ=%.4f, χ²=%.2f", 
+                     allFitResults[w][anchorIdx].mean,
+                     allFitResults[w][anchorIdx].sigma,
+                     allFitResults[w][anchorIdx].chi2ndf) << endl;
+      } else {
+        cout << "  ANCHOR FAILED! This is unexpected." << endl;
+      }
+    }
+    
+    // Step 2: Fit Phase 0 using anchor parameters
+    // Slices: [175,180], [170,180], ..., [0,180] - all with right edge at 180
+    cout << "Fitting Phase 0 (backward, using anchor params)..." << endl;
+    PropagatedParams prevParams = anchorParams;  // START WITH ANCHOR PARAMS!
+    
+    for (size_t k = 0; k < phase0Indices.size(); ++k) {
+      int i = phase0Indices[k];
+      
       int xbin_lo = h2DB->GetXaxis()->FindFixBin(momLows[i] + 0.01);
       int xbin_hi = h2DB->GetXaxis()->FindFixBin(momHighs[i] - 0.01);
       
@@ -627,31 +893,143 @@ void pid_macro_multistep_beta() {
 
       allFitResults[w][i] = tryFitDeltaBeta(proj, fitRangeMin, fitRangeMax, i, w,
                                              momCenters[i], momLows[i], momHighs[i], 
-                                             sliceWidths[i], phaseTag[i]);
+                                             sliceWidths[i], phaseTag[i], prevParams);
       
-      if (allFitResults[w][i].success) nSuccess++;
-
-      // Print progress for selected slices
-      TString phaseStr = (phaseTag[i] == 0) ? "[P0]" : ((phaseTag[i] == 1) ? "[P1]" : "[P2]");
-      if (i < 3 || i == nPhase0 - 1 || i == nPhase0 || i >= nSlices - 3 || phaseTag[i] == 2) {
-        if (allFitResults[w][i].success) {
-          cout << Form("  Slice %4d: p=[%6.0f,%6.0f], w=%5.0f, μ=%7.4f, σ=%6.4f, χ²/n=%.2f %s", 
-                       i, momLows[i], momHighs[i], sliceWidths[i],
+      if (allFitResults[w][i].success) {
+        nSuccess++;
+        prevParams = fitResultToProps(allFitResults[w][i]);
+        
+        if (k < 3 || k == phase0Indices.size() - 1) {
+          cout << Form("  P0[%2zu] [%3.0f,%3.0f] w=%3.0f: μ=%7.4f, σ=%6.4f, χ²=%.2f",
+                       k, momLows[i], momHighs[i], sliceWidths[i],
                        allFitResults[w][i].mean, allFitResults[w][i].sigma,
-                       allFitResults[w][i].chi2ndf, phaseStr.Data()) << endl;
-        } else {
-          cout << Form("  Slice %4d: p=[%6.0f,%6.0f], FAIL %s", 
-                       i, momLows[i], momHighs[i], phaseStr.Data()) << endl;
+                       allFitResults[w][i].chi2ndf) << endl;
+        } else if (k == 3) {
+          cout << "  ..." << endl;
         }
-      } else if (i == 3) {
-        cout << "  ... (more slices) ..." << endl;
+      } else {
+        // DON'T update prevParams on failure - keep using last good params
+        cout << Form("  P0[%2zu] [%3.0f,%3.0f] w=%3.0f: FAILED (entries=%.0f, prevParams.valid=%d)",
+                     k, momLows[i], momHighs[i], sliceWidths[i], 
+                     allFitResults[w][i].entries, prevParams.valid ? 1 : 0) << endl;
       }
+      // Keep previous params even if this fit failed
+      
       delete proj;
     }
     
-    cout << "Success: " << nSuccess << "/" << nSlices << endl;
+    // Print Phase 0 summary
+    int p0Success = 0;
+    for (size_t k = 0; k < phase0Indices.size(); ++k) {
+      int i = phase0Indices[k];
+      if (allFitResults[w][i].success) p0Success++;
+    }
+    cout << "Phase 0 success: " << p0Success << "/" << nPhase0 << endl;
+    
+    // Step 3: Fit rest of Phase 1 FORWARD (skip anchor which is already done)
+    cout << "Fitting Phase 1 (forward from " << startMom << " to " << transitionMom << ")..." << endl;
+    prevParams = anchorParams;  // Restart from anchor
+    
+    for (size_t k = 1; k < phase1Indices.size(); ++k) {  // Start from 1, skip anchor
+      int i = phase1Indices[k];
+      
+      int xbin_lo = h2DB->GetXaxis()->FindFixBin(momLows[i] + 0.01);
+      int xbin_hi = h2DB->GetXaxis()->FindFixBin(momHighs[i] - 0.01);
+      
+      TString projName = Form("proj_db_w%d_s%d", w, i);
+      if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
+      TH1D* proj = h2DB->ProjectionY(projName, xbin_lo, xbin_hi, "e");
 
-    // Display fits
+      allFitResults[w][i] = tryFitDeltaBeta(proj, fitRangeMin, fitRangeMax, i, w,
+                                             momCenters[i], momLows[i], momHighs[i], 
+                                             sliceWidths[i], phaseTag[i], prevParams);
+      
+      if (allFitResults[w][i].success) {
+        nSuccess++;
+        prevParams = fitResultToProps(allFitResults[w][i]);
+      }
+      
+      delete proj;
+    }
+    
+    // Get params from end of Phase 1 for Phase 2
+    PropagatedParams phase1EndParams = prevParams;
+    
+    // Step 4: Fit Phase 2 FORWARD
+    cout << "Fitting Phase 2 (doubling from " << transitionMom << " to " << endMom << ")..." << endl;
+    prevParams = phase1EndParams;
+    
+    for (size_t k = 0; k < phase2Indices.size(); ++k) {
+      int i = phase2Indices[k];
+      
+      int xbin_lo = h2DB->GetXaxis()->FindFixBin(momLows[i] + 0.01);
+      int xbin_hi = h2DB->GetXaxis()->FindFixBin(momHighs[i] - 0.01);
+      
+      TString projName = Form("proj_db_w%d_s%d", w, i);
+      if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
+      TH1D* proj = h2DB->ProjectionY(projName, xbin_lo, xbin_hi, "e");
+
+      allFitResults[w][i] = tryFitDeltaBeta(proj, fitRangeMin, fitRangeMax, i, w,
+                                             momCenters[i], momLows[i], momHighs[i], 
+                                             sliceWidths[i], phaseTag[i], prevParams);
+      
+      if (allFitResults[w][i].success) {
+        nSuccess++;
+        prevParams = fitResultToProps(allFitResults[w][i]);
+        cout << Form("  P2[%zu] p=[%6.0f,%6.0f] w=%4.0f: μ=%7.4f, σ=%6.4f, χ²=%.2f",
+                     k, momLows[i], momHighs[i], sliceWidths[i],
+                     allFitResults[w][i].mean, allFitResults[w][i].sigma,
+                     allFitResults[w][i].chi2ndf) << endl;
+      } else {
+        cout << Form("  P2[%zu] p=[%6.0f,%6.0f] w=%4.0f: FAIL", 
+                     k, momLows[i], momHighs[i], sliceWidths[i]) << endl;
+      }
+      
+      delete proj;
+    }
+    
+    cout << "Total success: " << nSuccess << "/" << nSlices << endl;
+
+    // =====================================================
+    // SELECT DISPLAY INDICES (after all fits are done)
+    // =====================================================
+    std::vector<int> displayIndices;
+    
+    // From Phase 0: first (anchor), a few intermediate, last (0-120)
+    if (nPhase0 > 0) {
+      displayIndices.push_back(phase0Indices[0]);  // Anchor [120-baseW, 120]
+      if (nPhase0 > 3) displayIndices.push_back(phase0Indices[nPhase0/3]);
+      if (nPhase0 > 2) displayIndices.push_back(phase0Indices[2*nPhase0/3]);
+      displayIndices.push_back(phase0Indices[nPhase0-1]);  // [0, 120]
+    }
+    
+    // From Phase 1: a few representative
+    if (nPhase1 > 0) {
+      for (int k = 0; k <= 4 && k < nPhase1; ++k) {
+        int idx = k * nPhase1 / 5;
+        if (idx < nPhase1) displayIndices.push_back(phase1Indices[idx]);
+      }
+    }
+    
+    // From Phase 2: all (usually just a few)
+    for (size_t k = 0; k < phase2Indices.size() && k < 4; ++k) {
+      displayIndices.push_back(phase2Indices[k]);
+    }
+    
+    // Remove duplicates and sort by momentum center
+    std::sort(displayIndices.begin(), displayIndices.end(), 
+              [&momCenters](int a, int b) { return momCenters[a] < momCenters[b]; });
+    displayIndices.erase(std::unique(displayIndices.begin(), displayIndices.end()), displayIndices.end());
+    if (displayIndices.size() > (size_t)nDisplayPerWidth)
+      displayIndices.resize(nDisplayPerWidth);
+
+    cFits[w] = new TCanvas(Form("c_fits_dBeta_%d", w), 
+                           Form("Delta-Beta Fits - %s", widthLabels[w].Data()), 1400, 900);
+    cFits[w]->Divide(4, 3);
+
+    // =====================================================
+    // DISPLAY FITS
+    // =====================================================
     for (size_t d = 0; d < displayIndices.size() && d < (size_t)nDisplayPerWidth; ++d) {
       int i = displayIndices[d];
       FitResult& result = allFitResults[w][i];
@@ -682,36 +1060,36 @@ void pid_macro_multistep_beta() {
       proj->SetMarkerSize(0.4);
       proj->Draw("E");
 
-      // Zero line (Δβ = 0 is the pion position)
+      // Zero line
       TLine* zeroLine = new TLine(0, 0, 0, proj->GetMaximum() * 1.1);
       zeroLine->SetLineColor(kGray+1);
       zeroLine->SetLineStyle(kDashed);
       zeroLine->Draw("same");
 
-      if (result.success && result.bkgParams.size() >= 3) {
-        TString funcExpr;
+      if (result.success && result.polyParams.size() > 0) {
         int nPolyParams = result.polyOrder + 1;
-        switch (result.polyOrder) {
-          case 0: funcExpr = "gaus(0) + gaus(3) + [6]"; break;
-          case 1: funcExpr = "gaus(0) + gaus(3) + [6] + [7]*x"; break;
-          case 2: funcExpr = "gaus(0) + gaus(3) + [6] + [7]*x + [8]*x*x"; break;
-          default: funcExpr = "gaus(0) + gaus(3) + [6]"; break;
+        
+        // Build total fit expression: gaus(0) + gaus(3) + poly at [6]
+        TString funcExpr = "gaus(0) + gaus(3)";
+        for (int pp = 0; pp <= result.polyOrder; ++pp) {
+          if (pp == 0) funcExpr += Form(" + [%d]", 6 + pp);
+          else funcExpr += Form(" + [%d]*pow(x,%d)", 6 + pp, pp);
         }
         
         TF1* fitFunc = new TF1(Form("fitdisp_db_w%d_d%d", w, (int)d), funcExpr, fitRangeMin, fitRangeMax);
         fitFunc->SetParameter(0, result.amplitude);
         fitFunc->SetParameter(1, result.mean);
         fitFunc->SetParameter(2, result.sigma);
-        fitFunc->SetParameter(3, result.bkgParams[0]);
-        fitFunc->SetParameter(4, result.bkgParams[1]);
-        fitFunc->SetParameter(5, result.bkgParams[2]);
+        fitFunc->SetParameter(3, result.bkgGausAmp);
+        fitFunc->SetParameter(4, result.bkgGausMean);
+        fitFunc->SetParameter(5, result.bkgGausSigma);
         for (int pp = 0; pp < nPolyParams; ++pp)
-          fitFunc->SetParameter(6 + pp, result.bkgParams[3 + pp]);
+          fitFunc->SetParameter(6 + pp, result.polyParams[pp]);
         fitFunc->SetLineColor(kRed);
         fitFunc->SetLineWidth(2);
         fitFunc->Draw("same");
 
-        // Signal Gaussian (blue solid)
+        // Signal Gaussian (blue solid, thick)
         TF1* sig = new TF1(Form("sig_db_w%d_d%d", w, (int)d), "gaus", fitRangeMin, fitRangeMax);
         sig->SetParameters(result.amplitude, result.mean, result.sigma);
         sig->SetLineColor(kBlue);
@@ -719,25 +1097,25 @@ void pid_macro_multistep_beta() {
         sig->SetLineWidth(3);
         sig->Draw("same");
 
-        // Background Gaussian (orange dashed)
-        TF1* bkgGaus = new TF1(Form("bkg_db_w%d_d%d", w, (int)d), "gaus", fitRangeMin, fitRangeMax);
-        bkgGaus->SetParameters(result.bkgParams[0], result.bkgParams[1], result.bkgParams[2]);
-        bkgGaus->SetLineColor(kOrange+1);
-        bkgGaus->SetLineStyle(kDashed);
-        bkgGaus->SetLineWidth(2);
-        bkgGaus->Draw("same");
+        // Background Gaussian (orange dashed) - only draw if amplitude > 0
+        if (result.bkgGausAmp > 0.001 * result.amplitude) {
+          TF1* bkgGaus = new TF1(Form("bkg_db_w%d_d%d", w, (int)d), "gaus", fitRangeMin, fitRangeMax);
+          bkgGaus->SetParameters(result.bkgGausAmp, result.bkgGausMean, result.bkgGausSigma);
+          bkgGaus->SetLineColor(kOrange+1);
+          bkgGaus->SetLineStyle(kDashed);
+          bkgGaus->SetLineWidth(2);
+          bkgGaus->Draw("same");
+        }
 
-        // Polynomial (green dashed)
+        // Polynomial (green dashed) - build proper expression
         TString polyExpr;
-        switch (result.polyOrder) {
-          case 0: polyExpr = "[0]"; break;
-          case 1: polyExpr = "[0] + [1]*x"; break;
-          case 2: polyExpr = "[0] + [1]*x + [2]*x*x"; break;
-          default: polyExpr = "[0]"; break;
+        for (int pp = 0; pp <= result.polyOrder; ++pp) {
+          if (pp == 0) polyExpr = "[0]";
+          else polyExpr += Form(" + [%d]*pow(x,%d)", pp, pp);
         }
         TF1* poly = new TF1(Form("poly_db_w%d_d%d", w, (int)d), polyExpr, fitRangeMin, fitRangeMax);
         for (int pp = 0; pp < nPolyParams; ++pp)
-          poly->SetParameter(pp, result.bkgParams[3 + pp]);
+          poly->SetParameter(pp, result.polyParams[pp]);
         poly->SetLineColor(kGreen+2);
         poly->SetLineStyle(kDashed);
         poly->SetLineWidth(2);
@@ -760,23 +1138,23 @@ void pid_macro_multistep_beta() {
         tex.SetTextColor(kBlue);
         tex.DrawLatex(0.55, 0.79, Form("#mu=%.4f", result.mean));
         tex.DrawLatex(0.55, 0.72, Form("#sigma=%.4f", result.sigma));
+        tex.SetTextColor(kOrange+1);
+        tex.DrawLatex(0.55, 0.65, Form("bkg=%.0f%%", 100.0 * result.bkgGausAmp / result.amplitude));
         tex.SetTextColor(kBlack);
-        tex.DrawLatex(0.55, 0.65, Form("pol%d", result.polyOrder));
-        if (result.chi2ndf >= 0.5 && result.chi2ndf <= 3.0) {
+        tex.DrawLatex(0.55, 0.58, Form("pol%d", result.polyOrder));
+        if (result.chi2ndf >= 0.3 && result.chi2ndf <= 4.0) {
           tex.SetTextColor(kGreen+2);
-        } else if (result.chi2ndf > 3.0 && result.chi2ndf <= 10.0) {
-          tex.SetTextColor(kOrange+1);
         } else {
-          tex.SetTextColor(kRed);
+          tex.SetTextColor(kOrange+1);
         }
-        tex.DrawLatex(0.55, 0.58, Form("#chi^{2}/n=%.1f", result.chi2ndf));
+        tex.DrawLatex(0.55, 0.51, Form("#chi^{2}/n=%.1f", result.chi2ndf));
         tex.SetTextColor(kBlack);
       } else {
         tex.SetTextColor(kRed);
         tex.DrawLatex(0.55, 0.77, "Fit failed");
         tex.SetTextColor(kBlack);
       }
-      tex.DrawLatex(0.55, 0.51, Form("N=%.0f", result.entries));
+      tex.DrawLatex(0.55, 0.44, Form("N=%.0f", result.entries));
       
       gPad->Modified();
       gPad->Update();
@@ -814,6 +1192,9 @@ void pid_macro_multistep_beta() {
     }
     
     if (rawP.size() < 5) continue;
+    
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
     int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
@@ -870,6 +1251,9 @@ void pid_macro_multistep_beta() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
+    
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
     int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
@@ -900,7 +1284,6 @@ void pid_macro_multistep_beta() {
 
   // =====================================================
   // TRANSFORM TO (p, β) SPACE
-  // β = β_pion(p) + Δβ
   // =====================================================
   
   TCanvas* cCombPB_1sig = new TCanvas("c_comb_pb_1sig", "Combined 1#sigma in (p, #beta)", 1000, 800);
@@ -929,6 +1312,9 @@ void pid_macro_multistep_beta() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
+    
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
     int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
@@ -941,14 +1327,12 @@ void pid_macro_multistep_beta() {
       double p = rawP[i];
       double beta_pion = betaPion(p);
       
-      // Upper: mean + σ (in Δβ) → β_pion + mean + σ
       double beta_upper = beta_pion + smoothMean[i] + 1.0 * smoothSigma[i];
       if (beta_upper > 0.3 && beta_upper < 1.15) {
         pPointsUpper.push_back(p);
         betaPointsUpper.push_back(beta_upper);
       }
       
-      // Lower: mean - σ (in Δβ) → β_pion + mean - σ
       double beta_lower = beta_pion + smoothMean[i] - 1.0 * smoothSigma[i];
       if (beta_lower > 0.3 && beta_lower < 1.15) {
         pPointsLower.push_back(p);
@@ -1002,6 +1386,9 @@ void pid_macro_multistep_beta() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
+    
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
     int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
@@ -1047,6 +1434,172 @@ void pid_macro_multistep_beta() {
   cCombPB_3sig->Update();
 
   // =====================================================
+  // TRANSFORM TO (p, mass²) SPACE
+  // =====================================================
+  
+  // Helper lambda: compute mass² from p and beta
+  auto mass2FromPBeta = [](double p, double beta) -> double {
+    if (beta <= 0.01 || beta >= 1.5) return -999999;
+    return p * p * (1.0 / (beta * beta) - 1.0);
+  };
+  
+  const double pionMass2 = gPionMass * gPionMass;  // ~19479.6 MeV²/c⁴
+  
+  // 1σ in (p, mass²)
+  TCanvas* cCombM2_1sig = new TCanvas("c_comb_m2_1sig", "Combined 1#sigma in (p, mass^{2})", 1000, 800);
+  cCombM2_1sig->cd();
+  if (h2M2) h2M2->Draw("colz");
+  
+  // Draw pion mass² line
+  TLine* pionLineM2_1 = new TLine(0, pionMass2, 1400, pionMass2);
+  pionLineM2_1->SetLineColor(kBlack);
+  pionLineM2_1->SetLineStyle(kDashed);
+  pionLineM2_1->SetLineWidth(2);
+  pionLineM2_1->Draw("same");
+  
+  TLegend* legM2_1 = new TLegend(0.12, 0.60, 0.42, 0.88);
+  legM2_1->SetHeader("1#sigma contours");
+
+  for (int w = 0; w < nWidths; ++w) {
+    std::vector<double> rawP, rawMean, rawSigma;
+    int nSlices = allMomCenters[w].size();
+    for (int i = 0; i < nSlices; ++i) {
+      if (allFitResults[w][i].success) {
+        rawP.push_back(allMomCenters[w][i]);
+        rawMean.push_back(allFitResults[w][i].mean);
+        rawSigma.push_back(allFitResults[w][i].sigma);
+      }
+    }
+    
+    if (rawP.size() < 5) continue;
+    
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
+    
+    int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
+    int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
+    std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
+    std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
+    
+    std::vector<double> pPointsUpper, m2PointsUpper;
+    std::vector<double> pPointsLower, m2PointsLower;
+    
+    for (size_t i = 0; i < rawP.size(); ++i) {
+      double p = rawP[i];
+      double beta_pion = betaPion(p);
+      
+      double beta_upper = beta_pion + smoothMean[i] + 1.0 * smoothSigma[i];
+      double m2_upper = mass2FromPBeta(p, beta_upper);
+      if (m2_upper > -20000 && m2_upper < 60000) {
+        pPointsUpper.push_back(p);
+        m2PointsUpper.push_back(m2_upper);
+      }
+      
+      double beta_lower = beta_pion + smoothMean[i] - 1.0 * smoothSigma[i];
+      double m2_lower = mass2FromPBeta(p, beta_lower);
+      if (m2_lower > -20000 && m2_lower < 60000) {
+        pPointsLower.push_back(p);
+        m2PointsLower.push_back(m2_lower);
+      }
+    }
+
+    if (!pPointsUpper.empty()) {
+      TGraph* gUpper = new TGraph(pPointsUpper.size(), pPointsUpper.data(), m2PointsUpper.data());
+      gUpper->SetLineColor(widthColors[w]);
+      gUpper->SetLineWidth(4);
+      gUpper->Draw("L");
+      legM2_1->AddEntry(gUpper, Form("%s", widthLabels[w].Data()), "l");
+    }
+    if (!pPointsLower.empty()) {
+      TGraph* gLower = new TGraph(pPointsLower.size(), pPointsLower.data(), m2PointsLower.data());
+      gLower->SetLineColor(widthColors[w]);
+      gLower->SetLineWidth(4);
+      gLower->Draw("L");
+    }
+  }
+  legM2_1->AddEntry(pionLineM2_1, Form("m_{#pi}^{2}=%.0f", pionMass2), "l");
+  legM2_1->Draw();
+  cCombM2_1sig->Modified();
+  cCombM2_1sig->Update();
+
+  // 3σ in (p, mass²)
+  TCanvas* cCombM2_3sig = new TCanvas("c_comb_m2_3sig", "Combined 3#sigma in (p, mass^{2})", 1000, 800);
+  cCombM2_3sig->cd();
+  if (h2M2) h2M2->Draw("colz");
+  
+  // Draw pion mass² line
+  TLine* pionLineM2_3 = new TLine(0, pionMass2, 1400, pionMass2);
+  pionLineM2_3->SetLineColor(kBlack);
+  pionLineM2_3->SetLineStyle(kDashed);
+  pionLineM2_3->SetLineWidth(2);
+  pionLineM2_3->Draw("same");
+  
+  TLegend* legM2_3 = new TLegend(0.12, 0.60, 0.42, 0.88);
+  legM2_3->SetHeader("3#sigma contours");
+
+  for (int w = 0; w < nWidths; ++w) {
+    std::vector<double> rawP, rawMean, rawSigma;
+    int nSlices = allMomCenters[w].size();
+    for (int i = 0; i < nSlices; ++i) {
+      if (allFitResults[w][i].success) {
+        rawP.push_back(allMomCenters[w][i]);
+        rawMean.push_back(allFitResults[w][i].mean);
+        rawSigma.push_back(allFitResults[w][i].sigma);
+      }
+    }
+    
+    if (rawP.size() < 5) continue;
+    
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
+    
+    int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
+    int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
+    std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
+    std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
+    
+    std::vector<double> pPointsUpper, m2PointsUpper;
+    std::vector<double> pPointsLower, m2PointsLower;
+    
+    for (size_t i = 0; i < rawP.size(); ++i) {
+      double p = rawP[i];
+      double beta_pion = betaPion(p);
+      
+      double beta_upper = beta_pion + smoothMean[i] + 3.0 * smoothSigma[i];
+      double m2_upper = mass2FromPBeta(p, beta_upper);
+      if (m2_upper > -20000 && m2_upper < 60000) {
+        pPointsUpper.push_back(p);
+        m2PointsUpper.push_back(m2_upper);
+      }
+      
+      double beta_lower = beta_pion + smoothMean[i] - 3.0 * smoothSigma[i];
+      double m2_lower = mass2FromPBeta(p, beta_lower);
+      if (m2_lower > -20000 && m2_lower < 60000) {
+        pPointsLower.push_back(p);
+        m2PointsLower.push_back(m2_lower);
+      }
+    }
+
+    if (!pPointsUpper.empty()) {
+      TGraph* gUpper = new TGraph(pPointsUpper.size(), pPointsUpper.data(), m2PointsUpper.data());
+      gUpper->SetLineColor(widthColors[w]);
+      gUpper->SetLineWidth(4);
+      gUpper->Draw("L");
+      legM2_3->AddEntry(gUpper, Form("%s", widthLabels[w].Data()), "l");
+    }
+    if (!pPointsLower.empty()) {
+      TGraph* gLower = new TGraph(pPointsLower.size(), pPointsLower.data(), m2PointsLower.data());
+      gLower->SetLineColor(widthColors[w]);
+      gLower->SetLineWidth(4);
+      gLower->Draw("L");
+    }
+  }
+  legM2_3->AddEntry(pionLineM2_3, Form("m_{#pi}^{2}=%.0f", pionMass2), "l");
+  legM2_3->Draw();
+  cCombM2_3sig->Modified();
+  cCombM2_3sig->Update();
+
+  // =====================================================
   // TRANSFORM TO (mass, a) SPACE
   // =====================================================
   
@@ -1076,6 +1629,9 @@ void pid_macro_multistep_beta() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
+    
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
     int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
@@ -1088,7 +1644,6 @@ void pid_macro_multistep_beta() {
       double p = rawP[i];
       double beta_pion = betaPion(p);
       
-      // Upper boundary
       double beta_upper = beta_pion + smoothMean[i] + 1.0 * smoothSigma[i];
       double mass_u, a_u;
       if (beta_upper > 0.1 && beta_upper < 1.5) {
@@ -1099,7 +1654,6 @@ void pid_macro_multistep_beta() {
         }
       }
       
-      // Lower boundary
       double beta_lower = beta_pion + smoothMean[i] - 1.0 * smoothSigma[i];
       double mass_l, a_l;
       if (beta_lower > 0.1 && beta_lower < 1.5) {
@@ -1157,6 +1711,9 @@ void pid_macro_multistep_beta() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
+    sortByMomentum(rawP, rawMean, rawSigma);
+    
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
     int gaussWin = (w == 0) ? 9 : (w == 1) ? 7 : 5;
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
@@ -1213,10 +1770,10 @@ void pid_macro_multistep_beta() {
   // PARAMETER PLOTS
   // =====================================================
   
-  TCanvas* cPar = new TCanvas("c_par", "Fit Parameters vs Momentum", 1200, 450);
-  cPar->Divide(3, 1);
+  TCanvas* cPar = new TCanvas("c_par", "Fit Parameters vs Momentum", 1200, 800);
+  cPar->Divide(2, 2);
 
-  // Mean (should be ~0)
+  // Mean
   cPar->cd(1);
   gPad->SetLeftMargin(0.14);
   TMultiGraph* mgMean = new TMultiGraph();
@@ -1269,8 +1826,34 @@ void pid_macro_multistep_beta() {
   mgSigma->Draw("A");
   legSigma->Draw();
 
-  // Chi2/ndf
+  // Background Gauss fraction
   cPar->cd(3);
+  gPad->SetLeftMargin(0.14);
+  TMultiGraph* mgBkg = new TMultiGraph();
+  TLegend* legBkg = new TLegend(0.55, 0.70, 0.88, 0.88);
+  for (int w = 0; w < nWidths; ++w) {
+    TGraph* g = new TGraph();
+    int np = 0;
+    for (size_t i = 0; i < allFitResults[w].size(); ++i) {
+      if (allFitResults[w][i].success && allFitResults[w][i].amplitude > 0) {
+        double frac = 100.0 * allFitResults[w][i].bkgGausAmp / allFitResults[w][i].amplitude;
+        g->SetPoint(np++, allMomCenters[w][i], frac);
+      }
+    }
+    g->SetMarkerStyle(20);
+    g->SetMarkerSize(0.3);
+    g->SetMarkerColor(widthColors[w]);
+    g->SetLineColor(widthColors[w]);
+    mgBkg->Add(g, "P");
+    legBkg->AddEntry(g, widthLabels[w], "p");
+  }
+  mgBkg->SetTitle("Background Gauss Fraction;p [MeV/c];Bkg/Signal [%]");
+  mgBkg->Draw("A");
+  mgBkg->GetYaxis()->SetRangeUser(0, 40);
+  legBkg->Draw();
+
+  // Chi2/ndf
+  cPar->cd(4);
   gPad->SetLeftMargin(0.14);
   TMultiGraph* mgChi2 = new TMultiGraph();
   TLegend* legChi2 = new TLegend(0.55, 0.70, 0.88, 0.88);
@@ -1309,34 +1892,32 @@ void pid_macro_multistep_beta() {
   cCombDB_3sig->SaveAs("pion_dBeta_combined_3sigma.png");
   cCombPB_1sig->SaveAs("pion_pbeta_combined_1sigma.png");
   cCombPB_3sig->SaveAs("pion_pbeta_combined_3sigma.png");
+  cCombM2_1sig->SaveAs("pion_mass2_combined_1sigma.png");
+  cCombM2_3sig->SaveAs("pion_mass2_combined_3sigma.png");
   cCombMA_1sig->SaveAs("pion_massa_combined_1sigma.png");
   cCombMA_3sig->SaveAs("pion_massa_combined_3sigma.png");
   cPar->SaveAs("pion_parameters_dBeta.png");
 
   // Output file
   std::ofstream outfile("pion_fit_results_dBeta.txt");
-  outfile << "Width\tpCenter\tpLow\tpHigh\tPhase\tMean_dBeta\tSigma_dBeta\tChi2NDF\tStatus" << std::endl;
+  outfile << "Width\tpCenter\tpLow\tpHigh\tPhase\tMean_dBeta\tSigma_dBeta\tBkgFrac[%]\tChi2NDF\tStatus" << std::endl;
   for (int w = 0; w < nWidths; ++w) {
     for (size_t i = 0; i < allMomCenters[w].size(); ++i) {
       FitResult& r = allFitResults[w][i];
       TString phaseStr = (r.phaseTag == 0) ? "BWD" : ((r.phaseTag == 1) ? "FWD" : "DBL");
+      double bkgFrac = (r.amplitude > 0) ? 100.0 * r.bkgGausAmp / r.amplitude : 0;
       outfile << widthLabels[w] << "\t" << r.pCenter << "\t" << r.pLow << "\t" << r.pHigh << "\t"
-              << phaseStr << "\t" << r.mean << "\t" << r.sigma << "\t" << r.chi2ndf << "\t"
+              << phaseStr << "\t" << r.mean << "\t" << r.sigma << "\t" << bkgFrac << "\t" << r.chi2ndf << "\t"
               << (r.success ? "OK" : "FAIL") << std::endl;
     }
   }
   outfile.close();
 
   cout << "\n=== Analysis Complete ===" << endl;
-  cout << "FIT MODEL: Δβ = β_measured - β_pion(p)" << endl;
-  cout << "  - Signal Gaussian: centered near Δβ=0, narrow σ" << endl;
-  cout << "  - Background Gaussian: broad, can be displaced" << endl;
-  cout << "  - Polynomial: pol0-pol2" << endl;
-  cout << "\nOutput files:" << endl;
-  cout << "  - pion_fits_dBeta_*.png" << endl;
-  cout << "  - pion_dBeta_combined_*.png" << endl;
-  cout << "  - pion_pbeta_combined_*.png" << endl;
-  cout << "  - pion_massa_combined_*.png" << endl;
-  cout << "  - pion_parameters_dBeta.png" << endl;
-  cout << "  - pion_fit_results_dBeta.txt" << endl;
+  cout << "IMPROVED FIT MODEL:" << endl;
+  cout << "  Stage 1: Signal Gauss + Polynomial (baseline)" << endl;
+  cout << "  Stage 2: Add Background Gauss (<=30% of signal)" << endl;
+  cout << "           Polynomial constrained around Stage 1 values" << endl;
+  cout << "  Parameter propagation between neighboring slices" << endl;
+  cout << "\nOutput files saved." << endl;
 }
