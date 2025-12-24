@@ -428,7 +428,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     delete fullFit;
     
     // Basic validation
-    if (chi2ndf > 20.0) continue;
+    if (chi2ndf > 200.0) continue;
     if (f_sigSigma < 0.003 || f_sigSigma > 0.07) continue;
     if (f_sigMean < -0.05 || f_sigMean > 0.05) continue;
     if (f_sigAmp < 0.3) continue;
@@ -607,9 +607,12 @@ void pid_macro_multistep_beta_pip() {
   gStyle->SetOptFit(111);
 
   // --- Build TChain
-  const char* treeName = "PipEpEm";
+  //const char* treeName = "PipEpEm";
+  const char* treeName = "Pip";
   const std::vector<TString> files = {
-	  "pp060_Sept2025.root"
+	  //"pp060_Sept2025.root"
+	  //#include "files_049_01_gen4.list"
+	  "GEN4/pp_049_gen4.root"
   };
   TChain* chain = new TChain(treeName);
   int added = 0;
@@ -628,6 +631,10 @@ void pid_macro_multistep_beta_pip() {
   }
   cout << "TChain: " << added << " files, " << nEnt << " entries" << endl;
 
+  TFile* fproton = TFile::Open("GEN4/protoncut.root", "READ");
+  TCutG* cut = nullptr;
+  fproton->GetObject("protoncut", cut);
+
   // =====================================================
   // CREATE 2D HISTOGRAMS
   // =====================================================
@@ -639,7 +646,7 @@ void pid_macro_multistep_beta_pip() {
     gPionMass, gPionMass, h2name);
 
   if (gDirectory->FindObject(h2name)) gDirectory->Delete(Form("%s;*", h2name));
-  chain->Draw(drawCmd, "isBest==1", "colz");
+  chain->Draw(drawCmd, "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3", "colz");
   TH2F* h2DB = static_cast<TH2F*>(gDirectory->Get(h2name));
   if (!h2DB) {
     cout << "Failed to create histogram" << endl;
@@ -653,7 +660,7 @@ void pid_macro_multistep_beta_pip() {
   // (p, β) histogram
   const char* h2pb_name = "h2_pip_beta";
   if (gDirectory->FindObject(h2pb_name)) gDirectory->Delete(Form("%s;*", h2pb_name));
-  chain->Draw(Form("pip_beta : pip_p >> %s(280,0,1400,300,0.3,1.15)", h2pb_name), "isBest==1", "colz");
+  chain->Draw(Form("pip_beta : pip_p >> %s(280,0,1400,300,0.3,1.15)", h2pb_name), "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3", "colz");
   TH2F* h2PB = static_cast<TH2F*>(gDirectory->Get(h2pb_name));
 
   // (mass, a) histogram
@@ -663,14 +670,14 @@ void pid_macro_multistep_beta_pip() {
     "pip_p*sqrt(1/pow(pip_beta,2) - 1) >> %s(300,0,300,160,0,16)",
     gSSquared, h2ma_name);
   if (gDirectory->FindObject(h2ma_name)) gDirectory->Delete(Form("%s;*", h2ma_name));
-  chain->Draw(drawMA, "isBest==1 && pip_beta>0 && pip_beta<1", "colz");
+  chain->Draw(drawMA, "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3 && pip_beta>0 && pip_beta<1.5", "colz");
   TH2F* h2MA = static_cast<TH2F*>(gDirectory->Get(h2ma_name));
 
   // (p, mass²) histogram - mass² = p² * (1/β² - 1)
   const char* h2m2_name = "h2_p_mass2";
   if (gDirectory->FindObject(h2m2_name)) gDirectory->Delete(Form("%s;*", h2m2_name));
   chain->Draw(Form("pip_p*pip_p*(1.0/(pip_beta*pip_beta) - 1) : pip_p >> %s(280,0,1400,400,-20000,60000)", h2m2_name), 
-              "isBest==1 && pip_beta>0.1 && pip_beta<1.5", "colz");
+              "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3 && pip_beta>0.1 && pip_beta<1.5", "colz");
   TH2F* h2M2 = static_cast<TH2F*>(gDirectory->Get(h2m2_name));
   if (h2M2) {
     h2M2->SetTitle("Mass^{2} vs Momentum (Pion)");
