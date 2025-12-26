@@ -326,9 +326,48 @@ ContourOutput generateSmoothedCuts(
   cout << "[TCutG] Averaged bins from good fits: " << rawP.size() 
        << " points, range [" << rawP.front() << ", " << rawP.back() << "] MeV/c" << endl;
   
-  // === EXTENSION: extend to high momentum using last good values ===
+  // === EXTENSION TO LOW MOMENTUM ===
+  double extendDownTo = 100.0;  // Extend down to 100 MeV/c
+  
+  if (rawP.front() > extendDownTo) {
+    // Get average of first few points for stable extension
+    int nAvg = std::min(5, (int)rawP.size());
+    double firstMean = 0, firstSigma = 0;
+    for (int i = 0; i < nAvg; ++i) {
+      firstMean += rawMean[i];
+      firstSigma += rawSigma[i];
+    }
+    firstMean /= nAvg;
+    firstSigma /= nAvg;
+    
+    cout << "[TCutG] Extending down from " << rawP.front() << " to " << extendDownTo 
+         << " MeV/c with mu=" << firstMean << ", sigma=" << firstSigma << endl;
+    
+    // Add extension points at the beginning (insert in reverse order)
+    std::vector<double> lowP, lowMean, lowSigma;
+    for (double p = rawP.front() - binSize; p >= extendDownTo; p -= binSize) {
+      lowP.push_back(p);
+      lowMean.push_back(firstMean);
+      lowSigma.push_back(firstSigma);
+    }
+    
+    // Reverse and prepend
+    std::reverse(lowP.begin(), lowP.end());
+    std::reverse(lowMean.begin(), lowMean.end());
+    std::reverse(lowSigma.begin(), lowSigma.end());
+    
+    lowP.insert(lowP.end(), rawP.begin(), rawP.end());
+    lowMean.insert(lowMean.end(), rawMean.begin(), rawMean.end());
+    lowSigma.insert(lowSigma.end(), rawSigma.begin(), rawSigma.end());
+    
+    rawP = lowP;
+    rawMean = lowMean;
+    rawSigma = lowSigma;
+  }
+  
+  // === EXTENSION TO HIGH MOMENTUM ===
   // At high p, beta resolution is dominated by detector, so sigma ~constant
-  double extendTo = 4000.0;  // Extend to 4000 MeV/c
+  double extendTo = 4500.0;  // Extend to 4500 MeV/c
   
   if (rawP.back() < extendTo) {
     // Get average of last few points for stable extension
@@ -1036,7 +1075,7 @@ void pid_macro_tcutg_p_sim() {
   // Main histogram: p vs Δβ (proton)
   const char* h2name = "h2_p_deltaBeta";
   TString drawCmd = Form(
-    "p_beta - p_p/sqrt(p_p*p_p + %.2f*%.2f) : p_p >> %s(400,0,4000,300,-0.15,0.15)",
+    "p_beta - p_p/sqrt(p_p*p_p + %.2f*%.2f) : p_p >> %s(450,0,4500,300,-0.15,0.15)",
     gProtonMass, gProtonMass, h2name);
 
   if (gDirectory->FindObject(h2name)) gDirectory->Delete(Form("%s;*", h2name));
@@ -1054,7 +1093,7 @@ void pid_macro_tcutg_p_sim() {
   // (p, β) histogram
   const char* h2pb_name = "h2_p_beta";
   if (gDirectory->FindObject(h2pb_name)) gDirectory->Delete(Form("%s;*", h2pb_name));
-  chain->Draw(Form("p_beta : p_p >> %s(400,0,4000,300,0.1,1.15)", h2pb_name), "isBest==1 && eVertReco_z>-500 && p_sim_id==14", "colz");
+  chain->Draw(Form("p_beta : p_p >> %s(450,0,4500,300,0.1,1.15)", h2pb_name), "isBest==1 && eVertReco_z>-500 && p_sim_id==14", "colz");
   TH2F* h2PB = static_cast<TH2F*>(gDirectory->Get(h2pb_name));
 
   // (mass, a) histogram
@@ -1070,7 +1109,7 @@ void pid_macro_tcutg_p_sim() {
   // (p, mass²) histogram - mass² = p² * (1/β² - 1)
   const char* h2m2_name = "h2_p_mass2";
   if (gDirectory->FindObject(h2m2_name)) gDirectory->Delete(Form("%s;*", h2m2_name));
-  chain->Draw(Form("p_p*p_p*(1.0/(p_beta*p_beta) - 1) : p_p >> %s(400,0,4000,400,0,2000000)", h2m2_name), 
+  chain->Draw(Form("p_p*p_p*(1.0/(p_beta*p_beta) - 1) : p_p >> %s(450,0,4500,400,0,2000000)", h2m2_name), 
               "isBest==1 && eVertReco_z>-500 && p_sim_id==14 && p_beta>0.1 && p_beta<1.5", "colz");
   TH2F* h2M2 = static_cast<TH2F*>(gDirectory->Get(h2m2_name));
   if (h2M2) {
@@ -1087,7 +1126,7 @@ void pid_macro_tcutg_p_sim() {
   const double warmupHigh = 350.0;
   const double startMom = 310.0;        // Anchor point
   const double transitionMom = 900.0;   // Where Phase 2 doubling starts
-  const double endMom = 4000.0;         // Extended range for protons
+  const double endMom = 4500.0;         // Extended range for protons
   const double stepSize = 1.0;          // 1 MeV/c steps in Phase 1
   
   const int nWidths = 4;
@@ -1637,7 +1676,7 @@ void pid_macro_tcutg_p_sim() {
   cCombDB_1sig->cd();
   h2DB->Draw("colz");
   
-  TLine* zeroLineDB1 = new TLine(0, 0, 4000, 0);
+  TLine* zeroLineDB1 = new TLine(0, 0, 4500, 0);
   zeroLineDB1->SetLineColor(kBlack);
   zeroLineDB1->SetLineStyle(kDashed);
   zeroLineDB1->SetLineWidth(2);
@@ -1705,7 +1744,7 @@ void pid_macro_tcutg_p_sim() {
   cCombDB_3sig->cd();
   h2DB->Draw("colz");
   
-  TLine* zeroLineDB3 = new TLine(0, 0, 4000, 0);
+  TLine* zeroLineDB3 = new TLine(0, 0, 4500, 0);
   zeroLineDB3->SetLineColor(kBlack);
   zeroLineDB3->SetLineStyle(kDashed);
   zeroLineDB3->SetLineWidth(2);
@@ -1777,7 +1816,7 @@ void pid_macro_tcutg_p_sim() {
   cCombPB_1sig->cd();
   if (h2PB) h2PB->Draw("colz");
   
-  TF1* protonCurvePB = new TF1("protonCurvePB", "x/sqrt(x*x + 938.272*938.272)", 0, 4000);
+  TF1* protonCurvePB = new TF1("protonCurvePB", "x/sqrt(x*x + 938.272*938.272)", 0, 4500);
   protonCurvePB->SetLineColor(kBlack);
   protonCurvePB->SetLineStyle(kDashed);
   protonCurvePB->SetLineWidth(2);
@@ -1874,7 +1913,7 @@ void pid_macro_tcutg_p_sim() {
   cCombPB_3sig->cd();
   if (h2PB) h2PB->Draw("colz");
   
-  TF1* protonCurvePB3 = new TF1("protonCurvePB3", "x/sqrt(x*x + 938.272*938.272)", 0, 4000);
+  TF1* protonCurvePB3 = new TF1("protonCurvePB3", "x/sqrt(x*x + 938.272*938.272)", 0, 4500);
   protonCurvePB3->SetLineColor(kBlack);
   protonCurvePB3->SetLineStyle(kDashed);
   protonCurvePB3->SetLineWidth(2);
@@ -2020,7 +2059,7 @@ void pid_macro_tcutg_p_sim() {
   if (h2M2) h2M2->Draw("colz");
   
   // Draw proton mass² line
-  TLine* protonLineM2_1 = new TLine(0, protonMass2, 4000, protonMass2);
+  TLine* protonLineM2_1 = new TLine(0, protonMass2, 4500, protonMass2);
   protonLineM2_1->SetLineColor(kBlack);
   protonLineM2_1->SetLineStyle(kDashed);
   protonLineM2_1->SetLineWidth(2);
@@ -2097,7 +2136,7 @@ void pid_macro_tcutg_p_sim() {
   if (h2M2) h2M2->Draw("colz");
   
   // Draw proton mass² line
-  TLine* protonLineM2_3 = new TLine(0, protonMass2, 4000, protonMass2);
+  TLine* protonLineM2_3 = new TLine(0, protonMass2, 4500, protonMass2);
   protonLineM2_3->SetLineColor(kBlack);
   protonLineM2_3->SetLineStyle(kDashed);
   protonLineM2_3->SetLineWidth(2);
@@ -2365,7 +2404,7 @@ void pid_macro_tcutg_p_sim() {
   mgMean->SetTitle("Mean #Delta#beta vs Momentum;p [MeV/c];#mu (#Delta#beta)");
   mgMean->Draw("A");
   mgMean->GetYaxis()->SetRangeUser(-0.02, 0.02);
-  TLine* zeroMean = new TLine(0, 0, 4000, 0);
+  TLine* zeroMean = new TLine(0, 0, 4500, 0);
   zeroMean->SetLineColor(kRed);
   zeroMean->SetLineStyle(kDashed);
   zeroMean->Draw("same");
@@ -2444,7 +2483,7 @@ void pid_macro_tcutg_p_sim() {
   mgChi2->SetTitle("#chi^{2}/ndf vs Momentum;p [MeV/c];#chi^{2}/ndf");
   mgChi2->Draw("A");
   mgChi2->GetYaxis()->SetRangeUser(0, 5);
-  TLine* chi2Line = new TLine(0, 1, 4000, 1);
+  TLine* chi2Line = new TLine(0, 1, 4500, 1);
   chi2Line->SetLineColor(kRed);
   chi2Line->SetLineStyle(kDashed);
   chi2Line->Draw("same");
@@ -2472,7 +2511,7 @@ void pid_macro_tcutg_p_sim() {
     selectedWidthForCuts,                  // Width index
     gProtonMass,                           // Particle mass (938.272 for proton)
     0.0,                                   // pMin [MeV/c] - will be clipped to data
-    4000.0,                                // pMax [MeV/c] - will be clipped to data
+    4500.0,                                // pMax [MeV/c] - will be clipped to data
     5.0,                                   // pStep for TCutG sampling [MeV/c]
     "p",                                   // Particle name prefix
     "p_p",                                 // TTree branch name for momentum
