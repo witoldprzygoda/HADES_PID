@@ -230,7 +230,8 @@ ContourOutput generateSmoothedCuts(
     const TString& varNameX,
     const TString& varNameY,
     int medianWindow,
-    int gaussWindow
+    int gaussWindow,
+    double extendHighTo = 0.0  // If > 0, extend to this momentum
 ) {
   ContourOutput out;
   out.valid = false;
@@ -274,6 +275,33 @@ ContourOutput generateSmoothedCuts(
   // --- Apply robust smoothing ---
   std::vector<double> smoothMean = robustSmooth(rawMean, medianWindow, gaussWindow);
   std::vector<double> smoothSigma = robustSmooth(rawSigma, medianWindow, gaussWindow);
+  
+  // === EXTENSION TO HIGH MOMENTUM ===
+  double dataMaxP = rawP.back();
+  if (extendHighTo > dataMaxP) {
+    // Get average of last few points for stable extension
+    int nAvg = std::min(5, (int)rawP.size());
+    double lastMean = 0, lastSigma = 0;
+    for (int i = rawP.size() - nAvg; i < (int)rawP.size(); ++i) {
+      lastMean += smoothMean[i];
+      lastSigma += smoothSigma[i];
+    }
+    lastMean /= nAvg;
+    lastSigma /= nAvg;
+    
+    cout << "[TCutG] Extending from " << dataMaxP << " to " << extendHighTo 
+         << " MeV/c with mu=" << lastMean << ", sigma=" << lastSigma << endl;
+    
+    // Add extension points
+    double extStep = 20.0;  // 20 MeV/c steps for extension
+    for (double p = dataMaxP + extStep; p <= extendHighTo; p += extStep) {
+      rawP.push_back(p);
+      smoothMean.push_back(lastMean);
+      smoothSigma.push_back(lastSigma);
+    }
+    
+    cout << "[TCutG] After extension: " << rawP.size() << " points" << endl;
+  }
   
   // --- Create TGraphs ---
   int nPts = rawP.size();
@@ -489,7 +517,7 @@ TCanvas* drawCutsOnHistogram(
   h2PB->Draw("colz");
   
   TF1* theoryCurve = new TF1("theoryCurve", 
-    Form("x/sqrt(x*x + %f*%f)", particleMass, particleMass), 0, 1500);
+    Form("x/sqrt(x*x + %f*%f)", particleMass, particleMass), 0, 2000);
   theoryCurve->SetLineColor(kBlack);
   theoryCurve->SetLineStyle(kDashed);
   theoryCurve->SetLineWidth(2);
@@ -936,7 +964,7 @@ void pid_macro_tcutg_pim_sim() {
   const char* treeName = "Pim";
   const std::vector<TString> files = {
 	  //"pp060_Sept2025.root"
-	  #include "SMASH/smash.list"
+	  #include "SMASH/smash_100.list"
   };
   TChain* chain = new TChain(treeName);
   int added = 0;
@@ -962,7 +990,7 @@ void pid_macro_tcutg_pim_sim() {
   // Main histogram: p vs Δβ (pion)
   const char* h2name = "h2_p_deltaBeta";
   TString drawCmd = Form(
-    "pim_beta - pim_p/sqrt(pim_p*pim_p + %.2f*%.2f) : pim_p >> %s(280,0,1400,300,-0.15,0.15)",
+    "pim_beta - pim_p/sqrt(pim_p*pim_p + %.2f*%.2f) : pim_p >> %s(400,0,2000,300,-0.15,0.15)",
     gPionMass, gPionMass, h2name);
 
   if (gDirectory->FindObject(h2name)) gDirectory->Delete(Form("%s;*", h2name));
@@ -980,7 +1008,7 @@ void pid_macro_tcutg_pim_sim() {
   // (p, β) histogram
   const char* h2pb_name = "h2_pim_beta";
   if (gDirectory->FindObject(h2pb_name)) gDirectory->Delete(Form("%s;*", h2pb_name));
-  chain->Draw(Form("pim_beta : pim_p >> %s(280,0,1400,300,0.3,1.15)", h2pb_name), "isBest==1 && eVertReco_z>-500 && pim_sim_id==9", "colz");
+  chain->Draw(Form("pim_beta : pim_p >> %s(400,0,2000,300,0.3,1.15)", h2pb_name), "isBest==1 && eVertReco_z>-500 && pim_sim_id==9", "colz");
   TH2F* h2PB = static_cast<TH2F*>(gDirectory->Get(h2pb_name));
 
   // (mass, a) histogram
@@ -996,7 +1024,7 @@ void pid_macro_tcutg_pim_sim() {
   // (p, mass²) histogram - mass² = p² * (1/β² - 1)
   const char* h2m2_name = "h2_p_mass2";
   if (gDirectory->FindObject(h2m2_name)) gDirectory->Delete(Form("%s;*", h2m2_name));
-  chain->Draw(Form("pim_p*pim_p*(1.0/(pim_beta*pim_beta) - 1) : pim_p >> %s(280,0,1400,400,-20000,60000)", h2m2_name), 
+  chain->Draw(Form("pim_p*pim_p*(1.0/(pim_beta*pim_beta) - 1) : pim_p >> %s(400,0,2000,400,-20000,60000)", h2m2_name), 
               "isBest==1 && eVertReco_z>-500 && pim_sim_id==9 && pim_beta>0.1 && pim_beta<1.5", "colz");
   TH2F* h2M2 = static_cast<TH2F*>(gDirectory->Get(h2m2_name));
   if (h2M2) {
@@ -1563,7 +1591,7 @@ void pid_macro_tcutg_pim_sim() {
   cCombDB_1sig->cd();
   h2DB->Draw("colz");
   
-  TLine* zeroLineDB1 = new TLine(0, 0, 1400, 0);
+  TLine* zeroLineDB1 = new TLine(0, 0, 2000, 0);
   zeroLineDB1->SetLineColor(kBlack);
   zeroLineDB1->SetLineStyle(kDashed);
   zeroLineDB1->SetLineWidth(2);
@@ -1631,7 +1659,7 @@ void pid_macro_tcutg_pim_sim() {
   cCombDB_3sig->cd();
   h2DB->Draw("colz");
   
-  TLine* zeroLineDB3 = new TLine(0, 0, 1400, 0);
+  TLine* zeroLineDB3 = new TLine(0, 0, 2000, 0);
   zeroLineDB3->SetLineColor(kBlack);
   zeroLineDB3->SetLineStyle(kDashed);
   zeroLineDB3->SetLineWidth(2);
@@ -1703,7 +1731,7 @@ void pid_macro_tcutg_pim_sim() {
   cCombPB_1sig->cd();
   if (h2PB) h2PB->Draw("colz");
   
-  TF1* pionCurvePB = new TF1("pionCurvePB", "x/sqrt(x*x + 139.57*139.57)", 0, 1400);
+  TF1* pionCurvePB = new TF1("pionCurvePB", "x/sqrt(x*x + 139.57*139.57)", 0, 2000);
   pionCurvePB->SetLineColor(kBlack);
   pionCurvePB->SetLineStyle(kDashed);
   pionCurvePB->SetLineWidth(2);
@@ -1800,7 +1828,7 @@ void pid_macro_tcutg_pim_sim() {
   cCombPB_3sig->cd();
   if (h2PB) h2PB->Draw("colz");
   
-  TF1* pionCurvePB3 = new TF1("pionCurvePB3", "x/sqrt(x*x + 139.57*139.57)", 0, 1400);
+  TF1* pionCurvePB3 = new TF1("pionCurvePB3", "x/sqrt(x*x + 139.57*139.57)", 0, 2000);
   pionCurvePB3->SetLineColor(kBlack);
   pionCurvePB3->SetLineStyle(kDashed);
   pionCurvePB3->SetLineWidth(2);
@@ -1946,7 +1974,7 @@ void pid_macro_tcutg_pim_sim() {
   if (h2M2) h2M2->Draw("colz");
   
   // Draw pion mass² line
-  TLine* pionLineM2_1 = new TLine(0, pionMass2, 1400, pionMass2);
+  TLine* pionLineM2_1 = new TLine(0, pionMass2, 2000, pionMass2);
   pionLineM2_1->SetLineColor(kBlack);
   pionLineM2_1->SetLineStyle(kDashed);
   pionLineM2_1->SetLineWidth(2);
@@ -2023,7 +2051,7 @@ void pid_macro_tcutg_pim_sim() {
   if (h2M2) h2M2->Draw("colz");
   
   // Draw pion mass² line
-  TLine* pionLineM2_3 = new TLine(0, pionMass2, 1400, pionMass2);
+  TLine* pionLineM2_3 = new TLine(0, pionMass2, 2000, pionMass2);
   pionLineM2_3->SetLineColor(kBlack);
   pionLineM2_3->SetLineStyle(kDashed);
   pionLineM2_3->SetLineWidth(2);
@@ -2291,7 +2319,7 @@ void pid_macro_tcutg_pim_sim() {
   mgMean->SetTitle("Mean #Delta#beta vs Momentum;p [MeV/c];#mu (#Delta#beta)");
   mgMean->Draw("A");
   mgMean->GetYaxis()->SetRangeUser(-0.02, 0.02);
-  TLine* zeroMean = new TLine(0, 0, 1400, 0);
+  TLine* zeroMean = new TLine(0, 0, 2000, 0);
   zeroMean->SetLineColor(kRed);
   zeroMean->SetLineStyle(kDashed);
   zeroMean->Draw("same");
@@ -2370,7 +2398,7 @@ void pid_macro_tcutg_pim_sim() {
   mgChi2->SetTitle("#chi^{2}/ndf vs Momentum;p [MeV/c];#chi^{2}/ndf");
   mgChi2->Draw("A");
   mgChi2->GetYaxis()->SetRangeUser(0, 5);
-  TLine* chi2Line = new TLine(0, 1, 1400, 1);
+  TLine* chi2Line = new TLine(0, 1, 2000, 1);
   chi2Line->SetLineColor(kRed);
   chi2Line->SetLineStyle(kDashed);
   chi2Line->Draw("same");
@@ -2391,20 +2419,21 @@ void pid_macro_tcutg_pim_sim() {
   
   cout << "Using width: " << widthLabels[selectedWidthForCuts] << endl;
   
-  // Generate smoothed contours and TCutG
+  // Generate smoothed contours and TCutG with extension to 2000 MeV/c
   ContourOutput contours = generateSmoothedCuts(
     allFitResults[selectedWidthForCuts],  // Fit results for selected width
     allMomCenters[selectedWidthForCuts],  // Momentum centers
     selectedWidthForCuts,                  // Width index
     gPionMass,                             // Particle mass (139.57 for pion)
     0.0,                                   // pMin [MeV/c] - will be clipped to data
-    1500.0,                                // pMax [MeV/c] - will be clipped to data
+    2000.0,                                // pMax [MeV/c] - target max
     5.0,                                   // pStep for TCutG sampling [MeV/c]
     "pim",                                 // Particle name prefix
     "pim_p",                               // TTree branch name for momentum
     "pim_beta",                            // TTree branch name for beta
     5,                                     // Median filter window
-    7                                      // Gaussian smoothing window
+    7,                                     // Gaussian smoothing window
+    2000.0                                 // extendHighTo - extend to 2000 MeV/c
   );
   
   // Save everything to ROOT file
@@ -2461,7 +2490,7 @@ void pid_macro_tcutg_pim_sim() {
   }
   outfile.close();
 
-  cout << "\n=== PION Analysis Complete ===" << endl;
+  cout << "\n=== PION (pi-) Analysis Complete ===" << endl;
   cout << "ROBUST FIT MODEL:" << endl;
   cout << "  1. Find peak max and 80% boundaries" << endl;
   cout << "  2. Preliminary Gauss fit to peak top (anchors position)" << endl;
@@ -2478,5 +2507,7 @@ void pid_macro_tcutg_pim_sim() {
   cout << "\n=== TCutG OUTPUT ===" << endl;
   cout << "  ROOT file: pim_pid_cuts.root" << endl;
   cout << "  Contains: FitResults TTree, Contours/, TCutG/" << endl;
+  cout << "  TCutG extended to 2000 MeV/c" << endl;
   cout << "\nOutput files saved." << endl;
 }
+

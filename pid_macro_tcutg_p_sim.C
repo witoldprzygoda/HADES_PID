@@ -1049,7 +1049,7 @@ void pid_macro_tcutg_p_sim() {
   // --- Build TChain
   const char* treeName = "P";
   const std::vector<TString> files = {
-	  #include "SMASH/smash.list"
+	  #include "SMASH/smash_100.list"
   };
   TChain* chain = new TChain(treeName);
   int added = 0;
