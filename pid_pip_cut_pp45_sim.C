@@ -1,4 +1,4 @@
-// pid_macro_multistep_beta_pion.C
+// pid_pip_cut_pp45_sim.C
 // PION PID analysis using Δβ = β_measured - β_pion(p) representation
 // 
 // ROBUST FITTING STRATEGY:
@@ -43,9 +43,14 @@
 #include "TMath.h"
 #include "TChain.h"
 #include "TSystem.h"
-#include "TCutG.h"
+
+// =====================================================
+// ADDITION #1: Additional includes for TCutG generation
+// =====================================================
 #include "TSpline.h"
+#include "TCutG.h"
 #include "TNamed.h"
+// =====================================================
 
 using std::cout; using std::endl;
 
@@ -116,7 +121,7 @@ struct PropagatedParams {
 };
 
 // =====================================================
-// ContourOutput structure for TCutG generation
+// ADDITION #2: ContourOutput structure for TCutG generation
 // =====================================================
 struct ContourOutput {
   TGraph* meanGraph;       // μ(p) after smoothing - in Δβ space
@@ -131,6 +136,7 @@ struct ContourOutput {
   int selectedWidth;       // Which width was used (0=1x, 1=2x, 2=3x, 3=4x)
   bool valid;              // Whether generation succeeded
 };
+// =====================================================
 
 // =====================================================
 // SMOOTHING FUNCTIONS
@@ -243,7 +249,7 @@ void extendToMomentum(std::vector<double>& p, std::vector<double>& mean,
 }
 
 // =====================================================
-// TCutG Generation Function
+// ADDITION #3: TCutG Generation Function
 // =====================================================
 ContourOutput generateSmoothedCuts(
     const std::vector<FitResult>& fitResults,
@@ -436,7 +442,7 @@ ContourOutput generateSmoothedCuts(
 }
 
 // =====================================================
-// Save Results Function
+// ADDITION #4: Save Results Function
 // =====================================================
 void saveContourResults(
     const ContourOutput& contours,
@@ -534,7 +540,7 @@ void saveContourResults(
 }
 
 // =====================================================
-// Draw Cuts on Histogram Function
+// ADDITION #5: Draw Cuts on Histogram Function
 // =====================================================
 TCanvas* drawCutsOnHistogram(
     TH2F* h2PB,
@@ -553,7 +559,7 @@ TCanvas* drawCutsOnHistogram(
   h2PB->Draw("colz");
   
   TF1* theoryCurve = new TF1("theoryCurve", 
-    Form("x/sqrt(x*x + %f*%f)", particleMass, particleMass), 0, gExtendTo);
+    Form("x/sqrt(x*x + %f*%f)", particleMass, particleMass), 0, 2000);
   theoryCurve->SetLineColor(kBlack);
   theoryCurve->SetLineStyle(kDashed);
   theoryCurve->SetLineWidth(2);
@@ -576,6 +582,10 @@ TCanvas* drawCutsOnHistogram(
   
   return c;
 }
+// =====================================================
+// END OF TCutG ADDITIONS
+// =====================================================
+
 
 // =====================================================
 // ROBUST FITTING FUNCTION
@@ -987,7 +997,7 @@ PropagatedParams fitResultToProps(const FitResult& r) {
 // MAIN FUNCTION
 // =====================================================
 
-void pid_macro_multistep_beta_pip_extended() {
+void pid_pip_cut_pp45_sim() {
   gROOT->SetBatch(kFALSE);
   gStyle->SetOptStat(0);
   gStyle->SetOptFit(111);
@@ -997,8 +1007,7 @@ void pid_macro_multistep_beta_pip_extended() {
   const char* treeName = "Pip";
   const std::vector<TString> files = {
 	  //"pp060_Sept2025.root"
-	  //#include "files_049_01_gen4.list"
-	  "GEN4/pp_049_gen4.root"
+	  #include "SMASH/smash_100.list"
   };
   TChain* chain = new TChain(treeName);
   int added = 0;
@@ -1032,7 +1041,7 @@ void pid_macro_multistep_beta_pip_extended() {
     gPionMass, gPionMass, h2name);
 
   if (gDirectory->FindObject(h2name)) gDirectory->Delete(Form("%s;*", h2name));
-  chain->Draw(drawCmd, "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3", "colz");
+  chain->Draw(drawCmd, "!protoncut && eVertReco_z>-500 && pip_sim_id==8", "colz");
   TH2F* h2DB = static_cast<TH2F*>(gDirectory->Get(h2name));
   if (!h2DB) {
     cout << "Failed to create histogram" << endl;
@@ -1046,7 +1055,8 @@ void pid_macro_multistep_beta_pip_extended() {
   // (p, β) histogram
   const char* h2pb_name = "h2_pip_beta";
   if (gDirectory->FindObject(h2pb_name)) gDirectory->Delete(Form("%s;*", h2pb_name));
-  chain->Draw(Form("pip_beta : pip_p >> %s(400,0,2000,300,0.3,1.15)", h2pb_name), "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3", "colz");
+  //chain->Draw(Form("pip_beta : pip_p >> %s(400,0,2000,300,0.3,1.15)", h2pb_name), "!protoncut && eVertReco_z>-500 && pip_sim_id==8", "colz");
+  chain->Draw(Form("pip_beta : pip_p >> %s(400,0,2000,300,0.0,1.2)", h2pb_name), "eVertReco_z>-500 && pip_sim_id==8", "colz");
   TH2F* h2PB = static_cast<TH2F*>(gDirectory->Get(h2pb_name));
 
   // (mass, a) histogram
@@ -1056,14 +1066,14 @@ void pid_macro_multistep_beta_pip_extended() {
     "pip_p*sqrt(1/pow(pip_beta,2) - 1) >> %s(300,0,300,160,0,16)",
     gSSquared, h2ma_name);
   if (gDirectory->FindObject(h2ma_name)) gDirectory->Delete(Form("%s;*", h2ma_name));
-  chain->Draw(drawMA, "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3 && pip_beta>0 && pip_beta<1.5", "colz");
+  chain->Draw(drawMA, "!protoncut && eVertReco_z>-500 &&  pip_sim_id==8 && pip_beta>0 && pip_beta<1.5", "colz");
   TH2F* h2MA = static_cast<TH2F*>(gDirectory->Get(h2ma_name));
 
   // (p, mass²) histogram - mass² = p² * (1/β² - 1)
   const char* h2m2_name = "h2_p_mass2";
   if (gDirectory->FindObject(h2m2_name)) gDirectory->Delete(Form("%s;*", h2m2_name));
   chain->Draw(Form("pip_p*pip_p*(1.0/(pip_beta*pip_beta) - 1) : pip_p >> %s(400,0,2000,400,-20000,60000)", h2m2_name), 
-              "!protoncut && isBest==1 && eVertReco_z>-500 && start_iteration==3 && pip_beta>0.1 && pip_beta<1.5", "colz");
+              "!protoncut && eVertReco_z>-500 && pip_sim_id==8 && pip_beta>0.1 && pip_beta<1.5", "colz");
   TH2F* h2M2 = static_cast<TH2F*>(gDirectory->Get(h2m2_name));
   if (h2M2) {
     h2M2->SetTitle("Mass^{2} vs Momentum (Pion)");
@@ -2467,23 +2477,78 @@ void pid_macro_multistep_beta_pip_extended() {
   legChi2->Draw();
 
   // =====================================================
+  // ADDITION #6: GENERATE AND SAVE TCutG OBJECTS
+  // =====================================================
+  
+  cout << "\n=============================================" << endl;
+  cout << "=== GENERATING TCutG OBJECTS ===" << endl;
+  cout << "=============================================" << endl;
+  
+  // SELECT WHICH WIDTH TO USE FOR FINAL CUTS
+  // Options: 0 = 1x(10), 1 = 2x(20), 2 = 3x(30), 3 = 4x(40)
+  // Recommendation: 1 (2x) balances resolution and statistics
+  int selectedWidthForCuts = 1;  // <-- CHANGE THIS TO SELECT DIFFERENT WIDTH
+  
+  cout << "Using width: " << widthLabels[selectedWidthForCuts] << endl;
+  
+  // Generate smoothed contours and TCutG with extension to 2000 MeV/c
+  ContourOutput contours = generateSmoothedCuts(
+    allFitResults[selectedWidthForCuts],  // Fit results for selected width
+    allMomCenters[selectedWidthForCuts],  // Momentum centers
+    selectedWidthForCuts,                  // Width index
+    gPionMass,                             // Particle mass (139.57 for pion)
+    0.0,                                   // pMin [MeV/c] - will be clipped to data
+    2000.0,                                // pMax [MeV/c] - target max
+    5.0,                                   // pStep for TCutG sampling [MeV/c]
+    "pip",                                 // Particle name prefix
+    "pip_p",                               // TTree branch name for momentum
+    "pip_beta",                            // TTree branch name for beta
+    5,                                     // Median filter window
+    7,                                     // Gaussian smoothing window
+    2000.0                                 // extendHighTo - extend to 2000 MeV/c
+  );
+  
+  // Save everything to ROOT file
+  if (contours.valid) {
+    saveContourResults(
+      contours,
+      allFitResults,
+      allMomCenters,
+      widthLabels,
+      nWidths,
+      "pip_pid_cuts_pp45_sim.root",                 // Output filename
+      "pip"                                // Particle name
+    );
+    
+    // Draw cuts on histogram
+    TCanvas* cCuts = drawCutsOnHistogram(h2PB, contours, "c_pip_cuts", gPionMass);
+    //if (cCuts) {
+    //  cCuts->SaveAs("pip_pid_cuts_overlay_pp45_sim.png");
+    //}
+  }
+  // =====================================================
+  // END OF TCutG GENERATION
+  // =====================================================
+
+  // =====================================================
   // SAVE OUTPUT
   // =====================================================
   
-  for (int w = 0; w < nWidths; ++w) {
-    cFits[w]->SaveAs(Form("pion_fits_dBeta_%s.png", widthLabels[w].Data()));
-  }
-  cCombDB_1sig->SaveAs("pion_dBeta_combined_1sigma.png");
-  cCombDB_3sig->SaveAs("pion_dBeta_combined_3sigma.png");
-  cCombPB_1sig->SaveAs("pion_pbeta_combined_1sigma.png");
-  cCombPB_3sig->SaveAs("pion_pbeta_combined_3sigma.png");
-  cCombM2_1sig->SaveAs("pion_mass2_combined_1sigma.png");
-  cCombM2_3sig->SaveAs("pion_mass2_combined_3sigma.png");
-  cCombMA_1sig->SaveAs("pion_massa_combined_1sigma.png");
-  cCombMA_3sig->SaveAs("pion_massa_combined_3sigma.png");
-  cPar->SaveAs("pion_parameters_dBeta.png");
+  //for (int w = 0; w < nWidths; ++w) {
+  //  cFits[w]->SaveAs(Form("pion_fits_dBeta_%s.png", widthLabels[w].Data()));
+  //}
+  //cCombDB_1sig->SaveAs("pion_dBeta_combined_1sigma.png");
+  //cCombDB_3sig->SaveAs("pion_dBeta_combined_3sigma.png");
+  //cCombPB_1sig->SaveAs("pion_pbeta_combined_1sigma.png");
+  //cCombPB_3sig->SaveAs("pion_pbeta_combined_3sigma.png");
+  //cCombM2_1sig->SaveAs("pion_mass2_combined_1sigma.png");
+  //cCombM2_3sig->SaveAs("pion_mass2_combined_3sigma.png");
+  //cCombMA_1sig->SaveAs("pion_massa_combined_1sigma.png");
+  //cCombMA_3sig->SaveAs("pion_massa_combined_3sigma.png");
+  //cPar->SaveAs("pion_parameters_dBeta.png");
 
   // Output file
+  /*
   std::ofstream outfile("pion_fit_results_dBeta.txt");
   outfile << "Width\tpCenter\tpLow\tpHigh\tPhase\tMean_dBeta\tSigma_dBeta\tBkgFrac[%]\tChi2NDF\tStatus" << std::endl;
   for (int w = 0; w < nWidths; ++w) {
@@ -2497,49 +2562,8 @@ void pid_macro_multistep_beta_pip_extended() {
     }
   }
   outfile.close();
-
-  // =====================================================
-  // TCutG GENERATION AND SAVING
-  // =====================================================
-  
-  // Use width 1 (2x) for final contours - typically best balance
-  int selectedWidth = 1;
-  
-  ContourOutput contours = generateSmoothedCuts(
-      allFitResults[selectedWidth],
-      allMomCenters[selectedWidth],
-      selectedWidth,
-      gPionMass,
-      50.0,                              // pMin
-      gExtendTo,                         // pMax (2000 MeV/c)
-      5.0,                               // pStep
-      "pip",                             // particleName
-      "pip_p",                           // varNameX
-      "pip_beta",                        // varNameY
-      7,                                 // medianWindow
-      9,                                 // gaussWindow
-      gExtendTo                          // extendHighTo
-  );
-  
-  if (contours.valid) {
-    saveContourResults(
-        contours,
-        allFitResults,
-        allMomCenters,
-        widthLabels,
-        nWidths,
-        "pip_pid_cuts.root",              // Output filename
-        "pip"                             // Particle name
-    );
-    
-    // Draw TCutG overlay on (p, beta) histogram
-    TCanvas* cCuts = drawCutsOnHistogram(h2PB, contours, "c_pip_cuts", gPionMass);
-    if (cCuts) {
-      cCuts->SaveAs("pip_pid_cuts_overlay.png");
-    }
-  }
-
-  cout << "\n=== PION (pi+) Analysis Complete ===" << endl;
+  */
+  cout << "\n=== PION Analysis Complete ===" << endl;
   cout << "ROBUST FIT MODEL:" << endl;
   cout << "  1. Find peak max and 80% boundaries" << endl;
   cout << "  2. Preliminary Gauss fit to peak top (anchors position)" << endl;
@@ -2556,6 +2580,6 @@ void pid_macro_multistep_beta_pip_extended() {
   cout << "\n=== TCutG OUTPUT ===" << endl;
   cout << "  ROOT file: pip_pid_cuts.root" << endl;
   cout << "  Contains: FitResults TTree, Contours/, TCutG/" << endl;
-  cout << "  TCutG extended to " << gExtendTo << " MeV/c" << endl;
+  cout << "  TCutG extended to 2000 MeV/c" << endl;
   cout << "\nOutput files saved." << endl;
 }

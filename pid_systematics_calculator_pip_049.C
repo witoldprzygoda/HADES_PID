@@ -8,6 +8,8 @@
 //
 // KEY DESIGN: Simulation is shown for comparison but EXCLUDED from systematics!
 //
+// SIGMA LEVELS: 1, 2.5, 3, 3.5, 5 sigma envelope cuts saved
+//
 // USAGE:
 //   root -l 'pid_systematics_calculator_pip.C("pip", "pip_syst_output.root")'
 //
@@ -218,7 +220,7 @@ vector<SystematicResult> calculateYieldSystematics(
 }
 
 // =====================================================
-// TCUTG COMPARISON PLOT
+// TCUTG COMPARISON PLOT (without zoomed version)
 // =====================================================
 
 void plotTCutGComparison(
@@ -287,8 +289,9 @@ void plotTCutGComparison(
   gPad->SetTopMargin(0.08);
   gPad->SetBottomMargin(0.12);
   
+  // Y-axis range changed to 0-1.5
   TH2F* frame3 = new TH2F("frame3", Form("%s: 3#sigma TCutG Comparison;p [MeV/c];#beta", particleName.Data()),
-                          100, 0, gMomentumMax, 100, 0.7, 1.15);
+                          100, 0, gMomentumMax, 100, 0.0, 1.5);
   frame3->SetStats(0);
   frame3->Draw();
   
@@ -332,8 +335,9 @@ void plotTCutGComparison(
   gPad->SetTopMargin(0.08);
   gPad->SetBottomMargin(0.12);
   
+  // Y-axis range changed to 0-1.5
   TH2F* frame5 = new TH2F("frame5", Form("%s: 5#sigma TCutG Comparison;p [MeV/c];#beta", particleName.Data()),
-                          100, 0, gMomentumMax, 100, 0.7, 1.15);
+                          100, 0, gMomentumMax, 100, 0.0, 1.5);
   frame5->SetStats(0);
   frame5->Draw();
   
@@ -371,59 +375,7 @@ void plotTCutGComparison(
   tex5.SetTextColor(kGreen+2);
   tex5.DrawLatex(0.15, 0.88, "#pi^{+}: 5#sigma comparison");
   
-  cComp->SaveAs(Form("%s_tcutg_exp_vs_sim.png", outputPrefix.Data()));
-  cout << "  Created: " << outputPrefix << "_tcutg_exp_vs_sim.png" << endl;
-  
-  // ===== Second canvas: Zoomed view at high momentum =====
-  TCanvas* cZoom = new TCanvas("c_tcutg_zoom", "TCutG Comparison: Zoomed", 1400, 600);
-  cZoom->Divide(2, 1);
-  
-  cZoom->cd(1);
-  gPad->SetLeftMargin(0.12);
-  gPad->SetRightMargin(0.05);
-  
-  TH2F* frameZ3 = new TH2F("frameZ3", "3#sigma Zoom (High p);p [MeV/c];#beta",
-                           100, 800, 2000, 100, 0.96, 1.02);
-  frameZ3->SetStats(0);
-  frameZ3->Draw();
-  
-  TF1* fTheoryZ = (TF1*)fTheory->Clone("fTheoryZ");
-  fTheoryZ->SetRange(800, 2000);
-  fTheoryZ->Draw("same");
-  
-  if (cut3exp) cut3exp->Draw("L same");
-  if (cut3sim) cut3sim->Draw("L same");
-  
-  TLegend* legZ3 = new TLegend(0.15, 0.70, 0.50, 0.88);
-  legZ3->SetTextSize(0.035);
-  if (cut3exp) legZ3->AddEntry(cut3exp, "Exp 3#sigma", "l");
-  if (cut3sim) legZ3->AddEntry(cut3sim, "Sim 3#sigma", "l");
-  legZ3->Draw();
-  
-  cZoom->cd(2);
-  gPad->SetLeftMargin(0.12);
-  gPad->SetRightMargin(0.05);
-  
-  TH2F* frameZ5 = new TH2F("frameZ5", "5#sigma Zoom (High p);p [MeV/c];#beta",
-                           100, 800, 2000, 100, 0.94, 1.15);
-  frameZ5->SetStats(0);
-  frameZ5->Draw();
-  
-  TF1* fTheoryZ2 = (TF1*)fTheory->Clone("fTheoryZ2");
-  fTheoryZ2->SetRange(800, 2000);
-  fTheoryZ2->Draw("same");
-  
-  if (cut5exp) cut5exp->Draw("L same");
-  if (cut5sim) cut5sim->Draw("L same");
-  
-  TLegend* legZ5 = new TLegend(0.15, 0.70, 0.50, 0.88);
-  legZ5->SetTextSize(0.035);
-  if (cut5exp) legZ5->AddEntry(cut5exp, "Exp 5#sigma", "l");
-  if (cut5sim) legZ5->AddEntry(cut5sim, "Sim 5#sigma", "l");
-  legZ5->Draw();
-  
-  cZoom->SaveAs(Form("%s_tcutg_exp_vs_sim_zoom.png", outputPrefix.Data()));
-  cout << "  Created: " << outputPrefix << "_tcutg_exp_vs_sim_zoom.png" << endl;
+  // NOTE: Zoomed canvas removed as requested
 }
 
 // =====================================================
@@ -812,7 +764,6 @@ void createComparisonPlots(const vector<SampleInfo>& samples, const vector<vecto
     }
   }
   legBand->Draw();
-  cMean->SaveAs(Form("%s_mean_comparison.png", outputPrefix.Data()));
   
   // ===== Plot 2: Sigma vs momentum =====
   TCanvas* cSigma = new TCanvas("c_sigma_comparison", "Sigma Comparison", 1400, 600);
@@ -878,7 +829,6 @@ void createComparisonPlots(const vector<SampleInfo>& samples, const vector<vecto
     }
   }
   legSBand->Draw();
-  cSigma->SaveAs(Form("%s_sigma_comparison.png", outputPrefix.Data()));
   
   // ===== Plot 3: Data vs Simulation =====
   bool hasSim = false;
@@ -935,8 +885,6 @@ void createComparisonPlots(const vector<SampleInfo>& samples, const vector<vecto
     mgDS->Draw("A");
     TLine* zd2 = new TLine(0, 0, gMomentumMax, 0);
     zd2->SetLineStyle(kDashed); zd2->SetLineColor(kGray+1); zd2->Draw("same");
-    
-    cDS->SaveAs(Form("%s_data_vs_sim.png", outputPrefix.Data()));
   }
   
   // ===== Plot 4: Relative uncertainty =====
@@ -953,15 +901,14 @@ void createComparisonPlots(const vector<SampleInfo>& samples, const vector<vecto
   gRel->GetYaxis()->SetRangeUser(0, 30);
   TLatex tx; tx.SetNDC(); tx.SetTextSize(0.025); tx.SetTextColor(kGray+2);
   tx.DrawLatex(0.15, 0.85, "Based on experimental samples only");
-  cU->SaveAs(Form("%s_relative_uncertainty.png", outputPrefix.Data()));
 }
 
 // =====================================================
-// SAVE RESULTS
+// SAVE RESULTS - Updated for 5 sigma levels
 // =====================================================
 void saveResults(const TString& outputFile, const TString& particleName,
                  const vector<SampleInfo>& samples, const vector<ComparisonPoint>& comparison,
-                 TCutG* env1, TCutG* env3, TCutG* env5, TCutG* ref3) {
+                 TCutG* env1, TCutG* env2p5, TCutG* env3, TCutG* env3p5, TCutG* env5, TCutG* ref3) {
   TFile* fOut = new TFile(outputFile, "RECREATE");
   
   TTree* tree = new TTree("SystematicComparison", "PID systematic comparison");
@@ -981,14 +928,20 @@ void saveResults(const TString& outputFile, const TString& particleName,
   }
   tree->Write();
   
+  // Save all 5 sigma levels: 1, 2.5, 3, 3.5, 5
   TDirectory* dE = fOut->mkdir("EnvelopeCuts"); dE->cd();
-  if (env1) env1->Write(); if (env3) env3->Write(); if (env5) env5->Write();
+  if (env1) env1->Write();
+  if (env2p5) env2p5->Write();
+  if (env3) env3->Write();
+  if (env3p5) env3p5->Write();
+  if (env5) env5->Write();
   
   TDirectory* dR = fOut->mkdir("ReferenceCut"); dR->cd();
   if (ref3) ref3->Write();
   
   fOut->Close(); delete fOut;
   cout << "[INFO] Saved to " << outputFile << endl;
+  cout << "  Envelope cuts saved: 1σ, 2.5σ, 3σ, 3.5σ, 5σ" << endl;
 }
 
 // =====================================================
@@ -1029,7 +982,7 @@ void printSummaryTable(const vector<SampleInfo>& samples, const vector<Compariso
 // =====================================================
 void pid_systematics_calculator_pip_049(
     const TString& particleName = "pip",
-    const TString& outputFile = "pip_systematics.root",
+    const TString& outputFile = "pid_pip_systematics.root",
     int widthIdx = 1
 ) {
   cout << "\n" << string(60, '=') << "\n  PID SYSTEMATICS CALCULATOR (π+)" << "\n" << string(60, '=') << endl;
@@ -1038,15 +991,15 @@ void pid_systematics_calculator_pip_049(
   // CONFIGURE YOUR INPUT FILES HERE - PION+ (pip)
   // =====================================================
   vector<SampleInfo> samples;
-  
+ 
   // EXPERIMENTAL (included in systematics)
   samples.push_back({"pip_pid_cuts_049_pippim.root", "pippim", "strategy", kExperimental, kRed, 20, 1});
   samples.push_back({"pip_pid_cuts_049_ppip.root", "ppip", "strategy", kExperimental, kBlue, 21, 1});
   samples.push_back({"pip_pid_cuts_049_pppippim.root", "pppippim", "strategy", kExperimental, kGreen+2, 22, 1});
   samples.push_back({"pip_pid_cuts_049_exp.root", "pip", "strategy", kReference, kYellow+1, 24, 1});
-  
+
   // SIMULATION (comparison only - NOT in systematics!)
-  samples.push_back({"pip_pid_cuts_SMASH_sim.root", "SMASH", "simulation", kSimulation, kBlack, 25, 2});
+  samples.push_back({"pip_pid_cuts_pp45_sim.root", "SMASH", "simulation", kSimulation, kBlack, 25, 2});
   
   // Check files
   vector<SampleInfo> valid;
@@ -1081,29 +1034,52 @@ void pid_systematics_calculator_pip_049(
   if (comparison.empty()) { cerr << "[ERROR] No comparison points!" << endl; return; }
   
   // Envelope cuts (experimental only) - Pion mass
+  // Now loading 5 sigma levels: 1, 2.5, 3, 3.5, 5
   double mass = 139.57;
-  vector<TCutG*> c1, c3, c5; TCutG* ref3 = nullptr;
+  vector<TCutG*> c1, c2p5, c3, c3p5, c5;
+  TCutG* ref3 = nullptr;
+  
   for (size_t s = 0; s < valid.size(); ++s) {
     if (valid[s].type == kSimulation) continue;
+    
+    // Cut names for all 5 sigma levels
     TString n1 = Form("cut_%s_1sig_w%d", particleName.Data(), widthIdx);
+    TString n2p5 = Form("cut_%s_25sig_w%d", particleName.Data(), widthIdx);
     TString n3 = Form("cut_%s_3sig_w%d", particleName.Data(), widthIdx);
+    TString n3p5 = Form("cut_%s_35sig_w%d", particleName.Data(), widthIdx);
     TString n5 = Form("cut_%s_5sig_w%d", particleName.Data(), widthIdx);
+    
+    // Load all sigma levels
     TCutG* t1 = loadTCutG(valid[s].filename, n1); if (t1) c1.push_back(t1);
+    TCutG* t2p5 = loadTCutG(valid[s].filename, n2p5); if (t2p5) c2p5.push_back(t2p5);
     TCutG* t3 = loadTCutG(valid[s].filename, n3); if (t3) c3.push_back(t3);
+    TCutG* t3p5 = loadTCutG(valid[s].filename, n3p5); if (t3p5) c3p5.push_back(t3p5);
     TCutG* t5 = loadTCutG(valid[s].filename, n5); if (t5) c5.push_back(t5);
+    
     if (valid[s].type == kReference && t3) ref3 = (TCutG*)t3->Clone(Form("ref_%s_3sig", particleName.Data()));
   }
   
+  // Generate envelope cuts for all 5 sigma levels
   TCutG* env1 = generateEnvelopeCut(c1, Form("envelope_%s_1sig", particleName.Data()), mass, 0, gMomentumMax);
+  TCutG* env2p5 = generateEnvelopeCut(c2p5, Form("envelope_%s_25sig", particleName.Data()), mass, 0, gMomentumMax);
   TCutG* env3 = generateEnvelopeCut(c3, Form("envelope_%s_3sig", particleName.Data()), mass, 0, gMomentumMax);
+  TCutG* env3p5 = generateEnvelopeCut(c3p5, Form("envelope_%s_35sig", particleName.Data()), mass, 0, gMomentumMax);
   TCutG* env5 = generateEnvelopeCut(c5, Form("envelope_%s_5sig", particleName.Data()), mass, 0, gMomentumMax);
+  
+  // Report which envelope cuts were successfully created
+  cout << "\n[INFO] Envelope cuts generated:" << endl;
+  cout << "  1σ:   " << (env1 ? "OK" : "FAILED (no input cuts)") << endl;
+  cout << "  2.5σ: " << (env2p5 ? "OK" : "FAILED (no input cuts)") << endl;
+  cout << "  3σ:   " << (env3 ? "OK" : "FAILED (no input cuts)") << endl;
+  cout << "  3.5σ: " << (env3p5 ? "OK" : "FAILED (no input cuts)") << endl;
+  cout << "  5σ:   " << (env5 ? "OK" : "FAILED (no input cuts)") << endl;
   
   // Plots
   TString prefix = outputFile; prefix.ReplaceAll(".root", "");
   createComparisonPlots(valid, allResults, comparison, particleName, prefix);
   
-  // Save
-  saveResults(outputFile, particleName, valid, comparison, env1, env3, env5, ref3);
+  // Save - now includes all 5 sigma levels
+  saveResults(outputFile, particleName, valid, comparison, env1, env2p5, env3, env3p5, env5, ref3);
   printSummaryTable(valid, comparison, particleName);
   
   // Calculate yield systematics
@@ -1119,7 +1095,7 @@ void pid_systematics_calculator_pip_049(
   calculateSimMismatch(comparison, 3.0);
   calculateSimMismatch(comparison, 5.0);
   
-  // Create TCutG comparison plot
+  // Create TCutG comparison plot (without zoomed version)
   TString refFile = "", simFile = "";
   for (const auto& s : valid) {
     if (s.type == kReference) refFile = s.filename;
@@ -1128,7 +1104,4 @@ void pid_systematics_calculator_pip_049(
   if (!refFile.IsNull() && !simFile.IsNull()) {
     plotTCutGComparison(refFile, simFile, particleName, prefix, widthIdx);
   }
-  
-  cout << "\nOutputs:\n  - " << outputFile << "\n  - " << prefix << "_*.png" << endl;
 }
-
