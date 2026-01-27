@@ -994,10 +994,11 @@ void pid_systematics_calculator_pip(
   
   // EXPERIMENTAL (included in systematics)
   samples.push_back({"pip_pid_cuts_049_exp.root", "Run 049", "temporal", kReference, kRed, 20, 1});
-  samples.push_back({"pip_pid_cuts_050_exp.root", "Run 050", "temporal", kExperimental, kBlue, 21, 1});
-  samples.push_back({"pip_pid_cuts_052_exp.root", "Run 051", "temporal", kExperimental, kGreen+2, 22, 1});
-  samples.push_back({"pip_pid_cuts_060_exp.root", "Run 060", "temporal", kExperimental, kMagenta, 23, 1});
-  samples.push_back({"pip_pid_cuts_066_exp.root", "Run 066", "temporal", kExperimental, kYellow+1, 24, 1});
+  samples.push_back({"pip_pid_cuts_049_exp.root", "Run 049 copy", "temporal", kReference, kRed, 21, 1});
+  //samples.push_back({"pip_pid_cuts_050_exp.root", "Run 050", "temporal", kExperimental, kBlue, 21, 1});
+  //samples.push_back({"pip_pid_cuts_052_exp.root", "Run 051", "temporal", kExperimental, kGreen+2, 22, 1});
+  //samples.push_back({"pip_pid_cuts_060_exp.root", "Run 060", "temporal", kExperimental, kMagenta, 23, 1});
+  //samples.push_back({"pip_pid_cuts_066_exp.root", "Run 066", "temporal", kExperimental, kYellow+1, 24, 1});
   
   // SIMULATION (comparison only - NOT in systematics!)
   samples.push_back({"pip_pid_cuts_pp45_sim.root", "SMASH", "simulation", kSimulation, kBlack, 25, 2});
