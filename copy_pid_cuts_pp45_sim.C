@@ -18,9 +18,11 @@ void copy_pid_cuts_pp45_sim() {
     };
     
     std::vector<ParticleInfo> particles = {
-        {"pim", "pim_pid_cuts_pp45_sim.root"},
+        {"p",   "p_pid_cuts_pp45_sim.root"},
         {"pip", "pip_pid_cuts_pp45_sim.root"},
-        {"p",   "p_pid_cuts_pp45_sim.root"}
+        {"pim", "pim_pid_cuts_pp45_sim.root"},
+        {"ep", "ep_pid_cuts_pp45_sim.root"},
+        {"em", "em_pid_cuts_pp45_sim.root"}
     };
     
     // Sigma levels to copy

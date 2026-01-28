@@ -6,14 +6,16 @@ void copy_pid_cuts_pp45_exp() {
     std::vector<std::pair<TString, TString>> files = {
         {"pid_p_systematics.root",   "p"},
         {"pid_pip_systematics.root", "pip"},
-        {"pid_pim_systematics.root", "pim"}
+        {"pid_pim_systematics.root", "pim"},
+        {"pid_ep_systematics.root", "ep"},
+        {"pid_em_systematics.root", "em"}
     };
     
     // Sigma levels to process - all 5 levels stored in files
     std::vector<TString> sigmas = {"1sig", "25sig", "3sig", "35sig", "5sig"};
     
     // Create output file
-    TFile *outFile = new TFile("pp45_pid_cuts_ver1.root", "RECREATE");
+    TFile *outFile = new TFile("pp45_pid_cuts_exp_ver1.root", "RECREATE");
     if (!outFile || outFile->IsZombie()) {
         std::cerr << "Error: Cannot create output file!" << std::endl;
         return;
