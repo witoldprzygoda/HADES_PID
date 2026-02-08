@@ -15,7 +15,7 @@ void copy_pid_cuts_pp45_exp() {
     std::vector<TString> sigmas = {"1sig", "25sig", "3sig", "35sig", "5sig"};
     
     // Create output file
-    TFile *outFile = new TFile("pp45_pid_cuts_exp_ver1.root", "RECREATE");
+    TFile *outFile = new TFile("pp45_pid_cuts_exp_ver2.root", "RECREATE");
     if (!outFile || outFile->IsZombie()) {
         std::cerr << "Error: Cannot create output file!" << std::endl;
         return;
