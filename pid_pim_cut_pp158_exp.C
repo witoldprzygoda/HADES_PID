@@ -1,12 +1,6 @@
-// pid_em_cut_pp45_exp.C
-// ELECTRON (e-) PID analysis using Δβ = β_measured - β_electron(p) representation
+// pid_pim_cut_pp158_exp.C
+// PION PID analysis using Δβ = β_measured - β_pion(p) representation
 // 
-// Adapted from pid_pip_cut_pp45_exp.C for HADES experiment
-// 
-// ELECTRON PHYSICS:
-// - Mass: 0.511 MeV/c² (highly relativistic at low momenta)
-// - Very narrow Δβ distributions expected due to ultra-relativistic nature
-//
 // ROBUST FITTING STRATEGY:
 // 1. Find peak maximum and 80% boundaries in data
 // 2. Preliminary Gaussian fit to peak top - ANCHORS signal position
@@ -15,12 +9,13 @@
 // 5. Final Gaussian fit to cleaned data - USE THESE for contours
 //
 // Scanning strategy:
-// - Warmup: [130, 160] MeV/c
-// - Anchor: 80 MeV/c
-// - Phase 0: right edge at anchor, width doubling going left to 0
-// - Phase 1: forward from anchor to transition with 1 MeV/c steps
-// - Phase 2: above transition, progressive doubling with sliding
-// - TCutG extended from p=0 to p=1600 MeV/c via extrapolation
+// - Warmup: [200, 400] MeV/c
+// - Anchor: 180 MeV/c
+// - Phase 0: right edge at 180, width doubling going left to 0
+// - Phase 1: forward from 180 to 500 with 1 MeV/c steps
+// - Phase 2: above 500, progressive doubling with sliding:
+//            double width, then slide "prev_width" steps of 1 MeV/c each
+//            This ensures smooth parameter propagation at high momentum
 
 #include <iostream>
 #include <fstream>
@@ -55,23 +50,22 @@
 using std::cout; using std::endl;
 
 // =====================================================
-// GLOBAL CONSTANTS - ELECTRON
+// GLOBAL CONSTANTS
 // =====================================================
-const double gElectronMass = 0.511;   // MeV/c² - electron/positron mass
-const double gSSquared = 1e-4;        // For (mass, a) transformation
-const double gExtendTo = 1400.0;      // Extend contours to this momentum [MeV/c]
-const double gExtendLow = 10.0;       // Extend contours down to this momentum [MeV/c] (avoid distortion at 0)
+const double gPionMass = 139.57;  // MeV/c²
+const double gSSquared = 1e-4;       // For (mass, a) transformation
+const double gExtendTo = 1400.0;     // Extend contours to this momentum [MeV/c]
 
 // =====================================================
-// PHYSICS FUNCTIONS - ELECTRON
+// PHYSICS FUNCTIONS
 // =====================================================
 
-double betaElectron(double p) {
-  return p / std::sqrt(p * p + gElectronMass * gElectronMass);
+double betaPion(double p) {
+  return p / std::sqrt(p * p + gPionMass * gPionMass);
 }
 
 double deltaBetaToBeta(double p, double dBeta) {
-  return betaElectron(p) + dBeta;
+  return betaPion(p) + dBeta;
 }
 
 double pBetaToMass(double p, double beta) {
@@ -96,15 +90,17 @@ bool pBetaToMassA(double p, double beta, double s2, double& mass, double& a) {
 // =====================================================
 struct FitResult {
   bool success;
-  double mean;
-  double sigma;
-  double amplitude;
+  double mean;        // Δβ mean (should be near 0 for pions)
+  double sigma;       // Δβ width
+  double amplitude;   // Signal amplitude
   int polyOrder;
   double chi2ndf;
   double entries;
   double pCenter, pLow, pHigh, sliceWidth;
   int phaseTag;
+  // Background Gauss parameters
   double bkgGausAmp, bkgGausMean, bkgGausSigma;
+  // Polynomial parameters
   std::vector<double> polyParams;
 };
 
@@ -117,6 +113,23 @@ struct PropagatedParams {
   double bkgAmp, bkgMean, bkgSigma;
   std::vector<double> polyParams;
   int polyOrder;
+};
+
+// =====================================================
+// ContourOutput structure for TCutG generation
+// =====================================================
+struct ContourOutput {
+  TGraph* meanGraph;       // μ(p) after smoothing - in Δβ space
+  TGraph* sigmaGraph;      // σ(p) after smoothing - in Δβ space
+  TSpline3* meanSpline;    // Interpolated μ(p) for smooth evaluation
+  TSpline3* sigmaSpline;   // Interpolated σ(p) for smooth evaluation
+  TCutG* cut1sig;          // 1σ contour in (p, β) plane
+  TCutG* cut25sig;         // 2.5σ contour in (p, β) plane
+  TCutG* cut3sig;          // 3σ contour in (p, β) plane
+  TCutG* cut35sig;         // 3.5σ contour in (p, β) plane
+  TCutG* cut5sig;          // 5σ contour in (p, β) plane
+  int selectedWidth;       // Which width was used (0=1x, 1=2x, 2=3x, 3=4x)
+  bool valid;              // Whether generation succeeded
 };
 
 // =====================================================
@@ -174,15 +187,19 @@ std::vector<double> robustSmooth(const std::vector<double>& data, int medianWin,
   return gaussianSmooth(temp, gaussWin, gaussWin / 3.0);
 }
 
+// Sort three vectors together by the first vector (momentum)
 void sortByMomentum(std::vector<double>& p, std::vector<double>& mean, std::vector<double>& sigma) {
   if (p.size() != mean.size() || p.size() != sigma.size()) return;
   
+  // Create index vector
   std::vector<size_t> indices(p.size());
   for (size_t i = 0; i < indices.size(); ++i) indices[i] = i;
   
+  // Sort indices by momentum
   std::sort(indices.begin(), indices.end(), 
             [&p](size_t a, size_t b) { return p[a] < p[b]; });
   
+  // Reorder all three vectors
   std::vector<double> pSorted(p.size()), meanSorted(p.size()), sigmaSorted(p.size());
   for (size_t i = 0; i < indices.size(); ++i) {
     pSorted[i] = p[indices[i]];
@@ -195,6 +212,11 @@ void sortByMomentum(std::vector<double>& p, std::vector<double>& mean, std::vect
   sigma = sigmaSorted;
 }
 
+// =====================================================
+// EXTEND DATA TO TARGET MOMENTUM
+// Extends p, mean, sigma arrays to targetP by repeating
+// the average of the last nAvg points (constant extrapolation)
+// =====================================================
 void extendToMomentum(std::vector<double>& p, std::vector<double>& mean, 
                        std::vector<double>& sigma, double targetP, 
                        double stepP = 20.0, int nAvg = 5) {
@@ -202,6 +224,7 @@ void extendToMomentum(std::vector<double>& p, std::vector<double>& mean,
   double dataMaxP = p.back();
   if (targetP <= dataMaxP) return;
   
+  // Get average of last nAvg points for stable extrapolation
   int actualAvg = std::min(nAvg, (int)p.size());
   double lastMean = 0, lastSigma = 0;
   for (int i = p.size() - actualAvg; i < (int)p.size(); ++i) {
@@ -211,6 +234,7 @@ void extendToMomentum(std::vector<double>& p, std::vector<double>& mean,
   lastMean /= actualAvg;
   lastSigma /= actualAvg;
   
+  // Add extension points at stepP intervals
   for (double pExt = dataMaxP + stepP; pExt <= targetP; pExt += stepP) {
     p.push_back(pExt);
     mean.push_back(lastMean);
@@ -218,45 +242,349 @@ void extendToMomentum(std::vector<double>& p, std::vector<double>& mean,
   }
 }
 
-// Extend to LOW momentum (extrapolate from first valid points)
-void extendToLowMomentum(std::vector<double>& p, std::vector<double>& mean, 
-                          std::vector<double>& sigma, double targetP, 
-                          double stepP = 5.0, int nAvg = 5) {
-  if (p.empty()) return;
-  double dataMinP = p.front();
-  if (targetP >= dataMinP) return;
+// =====================================================
+// TCutG Generation Function
+// =====================================================
+ContourOutput generateSmoothedCuts(
+    const std::vector<FitResult>& fitResults,
+    const std::vector<double>& momCenters,
+    int selectedWidth,
+    double particleMass,
+    double pMin, 
+    double pMax,
+    double pStep,
+    const TString& particleName,
+    const TString& varNameX,
+    const TString& varNameY,
+    int medianWindow,
+    int gaussWindow,
+    double extendHighTo = 0.0  // If > 0, extend to this momentum
+) {
+  ContourOutput out;
+  out.valid = false;
+  out.selectedWidth = selectedWidth;
+  out.meanGraph = nullptr;
+  out.sigmaGraph = nullptr;
+  out.meanSpline = nullptr;
+  out.sigmaSpline = nullptr;
+  out.cut1sig = nullptr;
+  out.cut25sig = nullptr;
+  out.cut3sig = nullptr;
+  out.cut35sig = nullptr;
+  out.cut5sig = nullptr;
+
+  // --- Extract successful fits ---
+  std::vector<double> rawP, rawMean, rawSigma;
   
-  int actualAvg = std::min(nAvg, (int)p.size());
-  double firstMean = 0, firstSigma = 0;
-  for (int i = 0; i < actualAvg; ++i) {
-    firstMean += mean[i];
-    firstSigma += sigma[i];
+  for (size_t i = 0; i < fitResults.size(); ++i) {
+    const FitResult& r = fitResults[i];
+    if (!r.success) continue;
+    
+    // Quality cuts - adjust these if needed for your data
+    if (r.chi2ndf > 10.0) continue;
+    if (r.sigma < 0.003 || r.sigma > 0.07) continue;
+    if (std::abs(r.mean) > 0.05) continue;
+    
+    rawP.push_back(momCenters[i]);
+    rawMean.push_back(r.mean);
+    rawSigma.push_back(r.sigma);
   }
-  firstMean /= actualAvg;
-  firstSigma /= actualAvg;
   
-  // Insert at beginning
-  std::vector<double> newP, newMean, newSigma;
-  for (double pExt = targetP; pExt < dataMinP; pExt += stepP) {
-    newP.push_back(pExt);
-    newMean.push_back(firstMean);
-    newSigma.push_back(firstSigma);
+  cout << "[TCutG] Selected width " << selectedWidth 
+       << ": " << rawP.size() << " valid points for contour generation" << endl;
+  
+  if (rawP.size() < 10) {
+    cerr << "[TCutG] ERROR: Too few valid points (<10) for spline fitting!" << endl;
+    return out;
   }
   
-  // Append original data
-  for (size_t i = 0; i < p.size(); ++i) {
-    newP.push_back(p[i]);
-    newMean.push_back(mean[i]);
-    newSigma.push_back(sigma[i]);
+  // --- Sort by momentum (CRITICAL for spline) ---
+  sortByMomentum(rawP, rawMean, rawSigma);
+  
+  // --- Apply robust smoothing ---
+  std::vector<double> smoothMean = robustSmooth(rawMean, medianWindow, gaussWindow);
+  std::vector<double> smoothSigma = robustSmooth(rawSigma, medianWindow, gaussWindow);
+  
+  // === EXTENSION TO HIGH MOMENTUM ===
+  double dataMaxP = rawP.back();
+  if (extendHighTo > dataMaxP) {
+    // Get average of last few points for stable extension
+    int nAvg = std::min(5, (int)rawP.size());
+    double lastMean = 0, lastSigma = 0;
+    for (int i = rawP.size() - nAvg; i < (int)rawP.size(); ++i) {
+      lastMean += smoothMean[i];
+      lastSigma += smoothSigma[i];
+    }
+    lastMean /= nAvg;
+    lastSigma /= nAvg;
+    
+    cout << "[TCutG] Extending from " << dataMaxP << " to " << extendHighTo 
+         << " MeV/c with mu=" << lastMean << ", sigma=" << lastSigma << endl;
+    
+    // Add extension points
+    double extStep = 20.0;  // 20 MeV/c steps for extension
+    for (double p = dataMaxP + extStep; p <= extendHighTo; p += extStep) {
+      rawP.push_back(p);
+      smoothMean.push_back(lastMean);
+      smoothSigma.push_back(lastSigma);
+    }
+    
+    cout << "[TCutG] After extension: " << rawP.size() << " points" << endl;
   }
   
-  p = newP;
-  mean = newMean;
-  sigma = newSigma;
+  // --- Create TGraphs ---
+  int nPts = rawP.size();
+  out.meanGraph = new TGraph(nPts, rawP.data(), smoothMean.data());
+  out.sigmaGraph = new TGraph(nPts, rawP.data(), smoothSigma.data());
+  
+  out.meanGraph->SetName(Form("g_%s_mean_w%d", particleName.Data(), selectedWidth));
+  out.meanGraph->SetTitle(Form("%s #Delta#beta mean vs p (width %d)", particleName.Data(), selectedWidth));
+  out.sigmaGraph->SetName(Form("g_%s_sigma_w%d", particleName.Data(), selectedWidth));
+  out.sigmaGraph->SetTitle(Form("%s #Delta#beta sigma vs p (width %d)", particleName.Data(), selectedWidth));
+  
+  // --- Create TSpline3 for smooth interpolation ---
+  out.meanSpline = new TSpline3(
+    Form("spline_%s_mean_w%d", particleName.Data(), selectedWidth),
+    out.meanGraph, "b2e2", 0, 0
+  );
+  out.sigmaSpline = new TSpline3(
+    Form("spline_%s_sigma_w%d", particleName.Data(), selectedWidth),
+    out.sigmaGraph, "b2e2", 0, 0
+  );
+  
+  // --- Determine actual momentum range from data ---
+  double pDataMin = rawP.front();
+  double pDataMax = rawP.back();
+  
+  // Clip requested range to data range (spline extrapolation is dangerous)
+  if (pMin < pDataMin) pMin = pDataMin;
+  if (pMax > pDataMax) pMax = pDataMax;
+  
+  cout << "[TCutG] Generating cuts in momentum range [" << pMin << ", " << pMax << "] MeV/c" << endl;
+  
+  // --- Lambda function to create one TCutG at given nSigma ---
+  auto makeCut = [&](double nSigma, const char* cutName) -> TCutG* {
+    std::vector<double> pCut, betaCut;
+    
+    // Forward pass: UPPER boundary
+    for (double p = pMin; p <= pMax; p += pStep) {
+      double mu = out.meanSpline->Eval(p);
+      double sig = out.sigmaSpline->Eval(p);
+      double betaTheory = p / std::sqrt(p*p + particleMass*particleMass);
+      double betaUpper = betaTheory + mu + nSigma * sig;
+      
+      if (betaUpper > 0.01 && betaUpper < 1.5) {
+        pCut.push_back(p);
+        betaCut.push_back(betaUpper);
+      }
+    }
+    
+    // Backward pass: LOWER boundary (closes the polygon)
+    for (double p = pMax; p >= pMin; p -= pStep) {
+      double mu = out.meanSpline->Eval(p);
+      double sig = out.sigmaSpline->Eval(p);
+      double betaTheory = p / std::sqrt(p*p + particleMass*particleMass);
+      double betaLower = betaTheory + mu - nSigma * sig;
+      
+      if (betaLower > 0.01 && betaLower < 1.5) {
+        pCut.push_back(p);
+        betaCut.push_back(betaLower);
+      }
+    }
+    
+    // Close the polygon
+    if (!pCut.empty()) {
+      pCut.push_back(pCut[0]);
+      betaCut.push_back(betaCut[0]);
+    }
+    
+    TCutG* cut = new TCutG(cutName, pCut.size(), pCut.data(), betaCut.data());
+    cut->SetVarX(varNameX.Data());
+    cut->SetVarY(varNameY.Data());
+    
+    return cut;
+  };
+  
+  // --- Generate cuts for 1σ, 2.5σ, 3σ, 3.5σ, 5σ ---
+  out.cut1sig = makeCut(1.0, Form("cut_%s_1sig_w%d", particleName.Data(), selectedWidth));
+  out.cut25sig = makeCut(2.5, Form("cut_%s_25sig_w%d", particleName.Data(), selectedWidth));
+  out.cut3sig = makeCut(3.0, Form("cut_%s_3sig_w%d", particleName.Data(), selectedWidth));
+  out.cut35sig = makeCut(3.5, Form("cut_%s_35sig_w%d", particleName.Data(), selectedWidth));
+  out.cut5sig = makeCut(5.0, Form("cut_%s_5sig_w%d", particleName.Data(), selectedWidth));
+  
+  // --- Set visual properties ---
+  out.cut1sig->SetLineColor(kRed);
+  out.cut1sig->SetLineWidth(2);
+  out.cut1sig->SetLineStyle(kSolid);
+  
+  out.cut3sig->SetLineColor(kBlue);
+  out.cut3sig->SetLineWidth(2);
+  out.cut3sig->SetLineStyle(kDashed);
+  
+  out.cut5sig->SetLineColor(kGreen+2);
+  out.cut5sig->SetLineWidth(2);
+  out.cut5sig->SetLineStyle(7);
+  
+  out.valid = true;
+  
+  cout << "[TCutG] Successfully generated cuts: " 
+       << out.cut1sig->GetName() << ", "
+       << out.cut3sig->GetName() << ", "
+       << out.cut5sig->GetName() << endl;
+  
+  return out;
 }
 
 // =====================================================
-// ROBUST FITTING FUNCTION - ELECTRON
+// Save Results Function
+// =====================================================
+void saveContourResults(
+    const ContourOutput& contours,
+    const std::vector<std::vector<FitResult>>& allFitResults,
+    const std::vector<std::vector<double>>& allMomCenters,
+    const TString widthLabels[],
+    int nWidths,
+    const TString& outputFileName,
+    const TString& particleName
+) {
+  TFile* fOut = new TFile(outputFileName, "RECREATE");
+  
+  if (!fOut || fOut->IsZombie()) {
+    cerr << "[TCutG] ERROR: Cannot create output file " << outputFileName << endl;
+    return;
+  }
+  
+  cout << "\n[TCutG] Saving results to " << outputFileName << endl;
+  
+  // Save raw fit results as TTree
+  TTree* tree = new TTree("FitResults", "Raw PID fit results in DeltaBeta representation");
+  
+  Double_t t_p, t_pLow, t_pHigh, t_mean, t_sigma, t_chi2, t_sliceWidth;
+  Int_t t_widthIdx, t_phaseTag, t_success;
+  
+  tree->Branch("p_center",    &t_p);
+  tree->Branch("p_low",       &t_pLow);
+  tree->Branch("p_high",      &t_pHigh);
+  tree->Branch("delta_beta_mean",  &t_mean);
+  tree->Branch("delta_beta_sigma", &t_sigma);
+  tree->Branch("chi2ndf",     &t_chi2);
+  tree->Branch("slice_width", &t_sliceWidth);
+  tree->Branch("width_idx",   &t_widthIdx);
+  tree->Branch("phase_tag",   &t_phaseTag);
+  tree->Branch("success",     &t_success);
+  
+  for (int w = 0; w < nWidths; ++w) {
+    for (size_t i = 0; i < allFitResults[w].size(); ++i) {
+      const FitResult& r = allFitResults[w][i];
+      t_p = r.pCenter;
+      t_pLow = r.pLow;
+      t_pHigh = r.pHigh;
+      t_mean = r.mean;
+      t_sigma = r.sigma;
+      t_chi2 = r.chi2ndf;
+      t_sliceWidth = r.sliceWidth;
+      t_widthIdx = w;
+      t_phaseTag = r.phaseTag;
+      t_success = r.success ? 1 : 0;
+      tree->Fill();
+    }
+  }
+  tree->Write();
+  cout << "  - TTree 'FitResults' with " << tree->GetEntries() << " entries" << endl;
+  
+  if (contours.valid) {
+    TDirectory* dirContours = fOut->mkdir("Contours");
+    dirContours->cd();
+    
+    contours.meanGraph->Write();
+    contours.sigmaGraph->Write();
+    contours.meanSpline->Write();
+    contours.sigmaSpline->Write();
+    
+    cout << "  - Smoothed TGraphs and TSpline3 objects" << endl;
+    
+    TDirectory* dirCuts = fOut->mkdir("TCutG");
+    dirCuts->cd();
+    
+    contours.cut1sig->Write();
+    contours.cut25sig->Write();
+    contours.cut3sig->Write();
+    contours.cut35sig->Write();
+    contours.cut5sig->Write();
+    
+    cout << "  - TCutG objects: " << contours.cut1sig->GetName() << ", "
+         << contours.cut25sig->GetName() << ", "
+         << contours.cut3sig->GetName() << ", " 
+         << contours.cut35sig->GetName() << ", "
+         << contours.cut5sig->GetName() << endl;
+  }
+  
+  fOut->cd();
+  TNamed* metaParticle = new TNamed("particle", particleName.Data());
+  TNamed* metaWidth = new TNamed("selected_width", Form("%d", contours.selectedWidth));
+  TNamed* metaWidthLabel = new TNamed("width_label", widthLabels[contours.selectedWidth].Data());
+  metaParticle->Write();
+  metaWidth->Write();
+  metaWidthLabel->Write();
+  
+  fOut->Close();
+  delete fOut;
+  
+  cout << "[TCutG] Output file saved successfully.\n" << endl;
+}
+
+// =====================================================
+// Draw Cuts on Histogram Function
+// =====================================================
+TCanvas* drawCutsOnHistogram(
+    TH2F* h2PB,
+    const ContourOutput& contours,
+    const TString& canvasName,
+    double particleMass
+) {
+  if (!contours.valid || !h2PB) {
+    cerr << "[TCutG] Cannot draw: invalid contours or histogram" << endl;
+    return nullptr;
+  }
+  
+  TCanvas* c = new TCanvas(canvasName, "PID Cuts in (p, #beta)", 1000, 800);
+  c->cd();
+  
+  h2PB->Draw("colz");
+  
+  TF1* theoryCurve = new TF1("theoryCurve", 
+    Form("x/sqrt(x*x + %f*%f)", particleMass, particleMass), 0, gExtendTo);
+  theoryCurve->SetLineColor(kBlack);
+  theoryCurve->SetLineStyle(kDashed);
+  theoryCurve->SetLineWidth(2);
+  theoryCurve->Draw("same");
+  
+  contours.cut1sig->Draw("L same");
+  contours.cut3sig->Draw("L same");
+  contours.cut5sig->Draw("L same");
+  
+  TLegend* leg = new TLegend(0.55, 0.15, 0.88, 0.40);
+  leg->SetHeader(Form("Width %d cuts", contours.selectedWidth));
+  leg->AddEntry(contours.cut1sig, "1#sigma", "l");
+  leg->AddEntry(contours.cut3sig, "3#sigma", "l");
+  leg->AddEntry(contours.cut5sig, "5#sigma", "l");
+  leg->AddEntry(theoryCurve, "Theory", "l");
+  leg->Draw();
+  
+  c->Modified();
+  c->Update();
+  
+  return c;
+}
+
+// =====================================================
+// ROBUST FITTING FUNCTION
+// New approach:
+//   1. Find peak maximum and 80% boundaries
+//   2. Preliminary Gaussian fit to peak top - anchors signal position
+//   3. Full fit with all components (signal + bkg Gauss + polynomial)
+//   4. Subtract polynomial and background Gauss from data
+//   5. Final Gaussian fit to cleaned data - USE THESE for contours
 // =====================================================
 
 FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx, int widthIdx,
@@ -265,7 +593,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   FitResult best;
   best.success = false;
   best.mean = 0.0;
-  best.sigma = 0.01;
+  best.sigma = 0.02;
   best.amplitude = 0.0;
   best.polyOrder = 2;
   best.chi2ndf = 1e9;
@@ -277,7 +605,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   best.phaseTag = phaseTag;
   best.bkgGausAmp = 0;
   best.bkgGausMean = 0;
-  best.bkgGausSigma = 0.05;
+  best.bkgGausSigma = 0.1;
 
   if (!proj || best.entries < 30) return best;
 
@@ -286,10 +614,14 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   double integral = proj->Integral(bin_min, bin_max);
   if (integral < 10.0) return best;
 
-  // STEP 1: Find peak
+  // =====================================================
+  // STEP 1: Find peak maximum and 80% boundaries
+  // Search in signal region near Δβ = 0
+  // =====================================================
   int bin_sig_lo = proj->FindFixBin(-0.06);
   int bin_sig_hi = proj->FindFixBin(0.06);
   
+  // Find smoothed maximum
   double peakVal = -1.0;
   int peakBin = 0;
   for (int b = bin_sig_lo; b <= bin_sig_hi; ++b) {
@@ -310,7 +642,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   double peakPos = (peakBin > 0) ? proj->GetBinCenter(peakBin) : 0.0;
   peakVal = (peakBin > 0) ? proj->GetBinContent(peakBin) : 1.0;
 
-  // Find 80% boundaries
+  // Find 80% boundaries (where yield drops to 80% of max)
   double threshold80 = 0.80 * peakVal;
   
   int bin80_lo = peakBin;
@@ -334,6 +666,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   double x80_lo = proj->GetBinCenter(bin80_lo);
   double x80_hi = proj->GetBinCenter(bin80_hi);
   
+  // Ensure we have at least 3 bins for preliminary fit
   if (bin80_hi - bin80_lo < 2) {
     bin80_lo = std::max(bin_sig_lo, peakBin - 2);
     bin80_hi = std::min(bin_sig_hi, peakBin + 2);
@@ -341,12 +674,15 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     x80_hi = proj->GetBinCenter(bin80_hi);
   }
 
-  // STEP 2: Preliminary Gaussian fit
+  // =====================================================
+  // STEP 2: Preliminary Gaussian fit to peak top only
+  // This ANCHORS where the signal must be
+  // =====================================================
   TF1* prelimFit = new TF1(Form("prelim_w%d_s%d", widthIdx, sliceIdx), "gaus", x80_lo, x80_hi);
   prelimFit->SetParameter(0, peakVal);
   prelimFit->SetParameter(1, peakPos);
   prelimFit->SetParameter(2, 0.01);
-  prelimFit->SetParLimits(1, x80_lo, x80_hi);
+  prelimFit->SetParLimits(1, x80_lo, x80_hi);  // Mean MUST be within 80% region
   prelimFit->SetParLimits(2, 0.002, 0.05);
   
   TFitResultPtr prelimRes = proj->Fit(prelimFit, "SQR0B");
@@ -359,7 +695,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   }
   delete prelimFit;
 
-  // Background estimate
+  // Background estimate from edges
   double bkgLeft = 0, bkgRight = 0;
   int nEdgeBins = 5;
   for (int b = bin_min; b < bin_min + nEdgeBins && b <= bin_max; ++b)
@@ -372,11 +708,13 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
 
   double sigAmpEst = std::max(1.0, peakVal - bkgAvg);
 
-  double initSigMean = anchorMean;
+  // Use propagated params for initialization, but anchor from preliminary fit
+  double initSigMean = anchorMean;  // From preliminary fit!
   double initSigSigma = anchorSigma;
   double initSigAmp = sigAmpEst;
   
   if (prevParams.valid) {
+    // Use propagated sigma as guide, but mean from preliminary fit
     initSigSigma = prevParams.sigSigma;
     double ampScale = integral / 1000.0;
     initSigAmp = prevParams.sigAmp * ampScale;
@@ -384,7 +722,10 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     if (initSigAmp > 10.0 * peakVal) initSigAmp = sigAmpEst;
   }
 
+  // =====================================================
   // STEP 3: Full fit with all components
+  // Try polynomial orders 2, 3, 4
+  // =====================================================
   struct FullFitResult {
     bool valid;
     double chi2ndf;
@@ -403,6 +744,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     int polyOrder = polyOrders[m];
     int nPolyParams = polyOrder + 1;
     
+    // Build expression: gaus(0) + gaus(3) + poly starting at [6]
     TString funcExpr = "gaus(0) + gaus(3)";
     for (int pp = 0; pp <= polyOrder; ++pp) {
       if (pp == 0) funcExpr += Form(" + [%d]", 6 + pp);
@@ -412,25 +754,30 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     TString funcName = Form("fullfit_w%d_s%d_p%d", widthIdx, sliceIdx, polyOrder);
     TF1* fullFit = new TF1(funcName, funcExpr, fitMin, fitMax);
     
+    // Signal Gaussian - CONSTRAINED around anchor position!
     fullFit->SetParameter(0, initSigAmp);
-    fullFit->SetParameter(1, anchorMean);
+    fullFit->SetParameter(1, anchorMean);  // From preliminary fit
     fullFit->SetParameter(2, initSigSigma);
     fullFit->SetParLimits(0, 0.1, std::max(10.0, 5.0 * peakVal));
-    double meanTol = 0.01;
+    // Mean constrained tightly around anchor
+    double meanTol = 0.01;  // ±0.01 around anchor
     fullFit->SetParLimits(1, anchorMean - meanTol, anchorMean + meanTol);
     fullFit->SetParLimits(2, 0.003, 0.06);
     
+    // Background Gaussian - constrained to not overshoot data
+    // Estimate max reasonable amplitude from data edges
     double edgeMax = std::max(bkgLeft, bkgRight);
-    double maxBkgAmp = std::min(0.3 * initSigAmp, 2.0 * edgeMax);
-    if (maxBkgAmp < 0.01 * initSigAmp) maxBkgAmp = 0.1 * initSigAmp;
+    double maxBkgAmp = std::min(0.3 * initSigAmp, 2.0 * edgeMax);  // Can't exceed 2x edge level
+    if (maxBkgAmp < 0.01 * initSigAmp) maxBkgAmp = 0.1 * initSigAmp;  // But allow some minimum
     
     fullFit->SetParameter(3, 0.05 * initSigAmp);
     fullFit->SetParLimits(3, 0.0, maxBkgAmp);
-    fullFit->SetParameter(4, 0.06);
+    fullFit->SetParameter(4, 0.06);  // Mean offset from signal
     fullFit->SetParLimits(4, 0.03, 0.12);
-    fullFit->SetParameter(5, 0.05);
+    fullFit->SetParameter(5, 0.05);  // Sigma - moderate width
     fullFit->SetParLimits(5, 0.025, 0.10);
     
+    // Polynomial
     if (prevParams.valid && prevParams.polyParams.size() > 0) {
       for (int pp = 0; pp < nPolyParams && pp < (int)prevParams.polyParams.size(); ++pp)
         fullFit->SetParameter(6 + pp, prevParams.polyParams[pp]);
@@ -453,6 +800,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     
     double chi2ndf = (res->Ndf() > 0) ? res->Chi2() / res->Ndf() : 1e6;
     
+    // Extract fit results
     double f_sigAmp = fullFit->GetParameter(0);
     double f_sigMean = fullFit->GetParameter(1);
     double f_sigSigma = fullFit->GetParameter(2);
@@ -465,6 +813,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     
     delete fullFit;
     
+    // Basic validation
     if (chi2ndf > 200.0) continue;
     if (f_sigSigma < 0.003 || f_sigSigma > 0.07) continue;
     if (f_sigMean < -0.05 || f_sigMean > 0.05) continue;
@@ -482,7 +831,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     results[m].polyParams = f_poly;
   }
 
-  // Select best model
+  // Select best model - prefer simpler polynomial if chi2 OK
   const double chi2_good_min = 0.3;
   const double chi2_good_max = 3.0;
   
@@ -510,13 +859,20 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     }
   }
   
-  if (bestIdx < 0) return best;
+  if (bestIdx < 0) return best;  // No valid fit
 
-  // STEP 4 & 5: Subtract background and refit
+  // =====================================================
+  // STEP 4 & 5: Subtract background and refit signal
+  // Create histogram with polynomial and bkg Gauss subtracted
+  // Then fit pure Gaussian to get final signal parameters
+  // =====================================================
+  
   FullFitResult& chosen = results[bestIdx];
   
+  // Create subtracted histogram
   TH1D* hSubtracted = (TH1D*)proj->Clone(Form("hsub_w%d_s%d", widthIdx, sliceIdx));
   
+  // Build polynomial function
   TF1* polyFunc = nullptr;
   {
     TString polyExpr;
@@ -529,9 +885,11 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
       polyFunc->SetParameter(pp, chosen.polyParams[pp]);
   }
   
+  // Build background Gaussian
   TF1* bkgGausFunc = new TF1("bkgGausFunc", "gaus", fitMin, fitMax);
   bkgGausFunc->SetParameters(chosen.bkgAmp, chosen.bkgMean, chosen.bkgSigma);
   
+  // Subtract polynomial and background Gauss from each bin
   for (int b = 1; b <= hSubtracted->GetNbinsX(); ++b) {
     double x = hSubtracted->GetBinCenter(b);
     double origVal = hSubtracted->GetBinContent(b);
@@ -539,12 +897,18 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
     double bkgGausVal = bkgGausFunc->Eval(x);
     double newVal = origVal - polyVal - bkgGausVal;
     hSubtracted->SetBinContent(b, newVal);
+    // Keep original error
   }
   
   delete polyFunc;
   delete bkgGausFunc;
   
-  // Final Gaussian fit
+  // =====================================================
+  // STEP 5: Final Gaussian fit to cleaned data
+  // These are the parameters we use for contours!
+  // =====================================================
+  
+  // Fit range around the signal peak
   double finalFitMin = anchorMean - 3.0 * chosen.sigSigma;
   double finalFitMax = anchorMean + 3.0 * chosen.sigSigma;
   if (finalFitMin < fitMin) finalFitMin = fitMin;
@@ -572,6 +936,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
       finalChi2ndf = finalRes->Chi2() / finalRes->Ndf();
     }
     
+    // Sanity check - if final fit gives crazy values, use full fit values
     if (finalSigma < 0.003 || finalSigma > 0.07 || 
         std::abs(finalMean - anchorMean) > 0.03) {
       finalMean = chosen.sigMean;
@@ -584,6 +949,9 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   delete finalGaus;
   delete hSubtracted;
   
+  // =====================================================
+  // Store results - use FINAL fit parameters for contours
+  // =====================================================
   best.success = true;
   best.mean = finalMean;
   best.sigma = finalSigma;
@@ -598,6 +966,7 @@ FitResult tryFitDeltaBeta(TH1D* proj, double fitMin, double fitMax, int sliceIdx
   return best;
 }
 
+// Convert FitResult to PropagatedParams
 PropagatedParams fitResultToProps(const FitResult& r) {
   PropagatedParams p;
   p.valid = r.success;
@@ -615,32 +984,39 @@ PropagatedParams fitResultToProps(const FitResult& r) {
 }
 
 // =====================================================
-// MAIN FUNCTION - ELECTRON PID
+// MAIN FUNCTION
 // =====================================================
 
-void pid_em_cut_pp158_exp() {
+void pid_pim_cut_pp158_exp() {
   gROOT->SetBatch(kFALSE);
   gStyle->SetOptStat(0);
   gStyle->SetOptFit(111);
 
-  // --- Build TChain for ELECTRON data ---
-  const char* treeName = "Em_ID";
-  
-  // Input file - opened twice (second time as "fake" systematics)
+  // --- Build TChain
+  //const char* treeName = "PimEpEm";
+  const char* treeName = "Pim";
   const std::vector<TString> files = {
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_01_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_02_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_03_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_04_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_05_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_06_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_07_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_08_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_09_pid_leptons.root",
-      "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/LEPTONS/had067_10_pid_leptons.root"
-
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_01_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_02_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_03_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_04_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_05_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_06_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_07_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_08_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_09_pid.root",
+          "/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had067_10_pid.root"
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_01_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_02_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_03_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_04_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_05_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_06_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_07_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_08_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_09_pid.root",
+          //"/hdd2/przygoda/hades/pp158/HADES_PID/GEN4/HADRONS/had068_10_pid.root"
   };
-  
   TChain* chain = new TChain(treeName);
   int added = 0;
   for (const auto& fn : files) {
@@ -653,90 +1029,82 @@ void pid_em_cut_pp158_exp() {
   }
   Long64_t nEnt = chain->GetEntries();
   if (added == 0 || nEnt <= 0) {
-    cout << "No entries found in TChain." << endl;
+    cout << "No entries found." << endl;
     return;
   }
   cout << "TChain: " << added << " files, " << nEnt << " entries" << endl;
 
+  //TFile* fproton = TFile::Open("GEN4/protoncut_pim.root", "READ");
+  //TCutG* cut = nullptr;
+  //fproton->GetObject("protoncut", cut);
+
   // =====================================================
-  // CREATE 2D HISTOGRAMS - ELECTRON
+  // CREATE 2D HISTOGRAMS
   // =====================================================
   
-  // Main histogram: p vs Δβ (electron)
-  const char* h2name = "h2_em_deltaBeta";
+  // Main histogram: p vs Δβ (pion)
+  const char* h2name = "h2_p_deltaBeta";
   TString drawCmd = Form(
-    "em_beta - em_p/sqrt(em_p*em_p + %.4f*%.4f) : em_p >> %s(280,0,1400,300,-0.15,0.15)",
-    gElectronMass, gElectronMass, h2name);
+    "pim_beta - pim_p/sqrt(pim_p*pim_p + %.2f*%.2f) : pim_p >> %s(280,0,1400,300,-0.15,0.15)",
+    gPionMass, gPionMass, h2name);
 
   if (gDirectory->FindObject(h2name)) gDirectory->Delete(Form("%s;*", h2name));
-  chain->Draw(drawCmd, "eVertReco_z>-500 && em_p>0 && em_beta>0 && em_beta<1.5 && start_iteration==3", "colz");
+  //chain->Draw(drawCmd, "!protoncut && eVertReco_z>-500 && start_iteration==3", "colz");
+  chain->Draw(drawCmd, "eVertReco_z>-500 && start_iteration==3", "colz");
   TH2F* h2DB = static_cast<TH2F*>(gDirectory->Get(h2name));
   if (!h2DB) {
-    cout << "Failed to create Δβ histogram" << endl;
+    cout << "Failed to create histogram" << endl;
     return;
   }
 
-  h2DB->SetTitle("Electron: Momentum vs #Delta#beta (#beta - #beta_{e^{-}})");
+  h2DB->SetTitle("Momentum vs #Delta#beta (#beta - #beta_{p})");
   h2DB->GetXaxis()->SetTitle("Momentum [MeV/c]");
-  h2DB->GetYaxis()->SetTitle("#Delta#beta = #beta - #beta_{e^{-}}");
+  h2DB->GetYaxis()->SetTitle("#Delta#beta = #beta - #beta_{p}");
 
   // (p, β) histogram
-  const char* h2pb_name = "h2_em_beta";
+  const char* h2pb_name = "h2_pim_beta";
   if (gDirectory->FindObject(h2pb_name)) gDirectory->Delete(Form("%s;*", h2pb_name));
-  chain->Draw(Form("em_beta : em_p >> %s(280,0,1400,300,0.0,1.2)", h2pb_name), 
-              "eVertReco_z>-500 && em_p>0 && em_beta>0 && em_beta<1.5 && start_iteration==3", "colz");
+  //chain->Draw(Form("pim_beta : pim_p >> %s(280,0,1400,300,0.0,1.2)", h2pb_name), "!protoncut && eVertReco_z>-500 && start_iteration==3", "colz");
+  chain->Draw(Form("pim_beta : pim_p >> %s(280,0,1400,300,0.0,1.2)", h2pb_name), "eVertReco_z>-500 && start_iteration==3", "colz");
   TH2F* h2PB = static_cast<TH2F*>(gDirectory->Get(h2pb_name));
-  if (h2PB) {
-    h2PB->SetTitle("Electron: #beta vs Momentum");
-    h2PB->GetXaxis()->SetTitle("Momentum [MeV/c]");
-    h2PB->GetYaxis()->SetTitle("#beta");
-  }
 
-  // (mass, a) histogram - SAME FORMULA AS ORIGINAL
-  // X-axis: mass = p*sqrt(1/β² - 1)
-  // Y-axis: a = sqrt(1 + s²p² - (1-β²)²)
-  const char* h2ma_name = "h2_em_mass_a";
+  // (mass, a) histogram
+  const char* h2ma_name = "h2_mass_a";
   TString drawMA = Form(
-    "sqrt(1 + %.1e*em_p*em_p - pow(1-em_beta*em_beta,2)) : "
-    "em_p*sqrt(1/pow(em_beta,2) - 1) >> %s(300,0,300,160,0,16)",
+    "sqrt(1 + %.1e*pim_p*pim_p - pow(1-pim_beta*pim_beta,2)) : "
+    "pim_p*sqrt(1/pow(pim_beta,2) - 1) >> %s(300,0,300,160,0,16)",
     gSSquared, h2ma_name);
   if (gDirectory->FindObject(h2ma_name)) gDirectory->Delete(Form("%s;*", h2ma_name));
-  chain->Draw(drawMA, "eVertReco_z>-500 && em_p>0 && em_beta>0 && em_beta<1.5 && start_iteration==3", "colz");
+  //chain->Draw(drawMA, "!protoncut && eVertReco_z>-500 && start_iteration==3 && pim_beta>0 && pim_beta<1.5", "colz");
+  chain->Draw(drawMA, "eVertReco_z>-500 && start_iteration==3 && pim_beta>0 && pim_beta<1.5", "colz");
   TH2F* h2MA = static_cast<TH2F*>(gDirectory->Get(h2ma_name));
-  if (h2MA) {
-    h2MA->SetTitle("Electron: a-parameter vs Mass");
-    h2MA->GetXaxis()->SetTitle("Mass [MeV/c^{2}]");
-    h2MA->GetYaxis()->SetTitle("a");
-  }
 
-  // (p, mass²) histogram - SAME FORMAT AS ORIGINAL
-  // X-axis: momentum
-  // Y-axis: mass² = p²(1/β² - 1)
-  const char* h2m2_name = "h2_em_mass2";
+  // (p, mass²) histogram - mass² = p² * (1/β² - 1)
+  const char* h2m2_name = "h2_p_mass2";
   if (gDirectory->FindObject(h2m2_name)) gDirectory->Delete(Form("%s;*", h2m2_name));
-  chain->Draw(Form("em_p*em_p*(1.0/(em_beta*em_beta) - 1) : em_p >> %s(280,0,1400,400,-20000,60000)", h2m2_name), 
-              "eVertReco_z>-500 && em_p>0 && em_beta>0.1 && em_beta<1.5 && start_iteration==3", "colz");
+  chain->Draw(Form("pim_p*pim_p*(1.0/(pim_beta*pim_beta) - 1) : pim_p >> %s(280,0,1400,400,-20000,60000)", h2m2_name), 
+              //"!protoncut && eVertReco_z>-500 && start_iteration==3 && pim_beta>0.1 && pim_beta<1.5", "colz");
+              "eVertReco_z>-500 && start_iteration==3 && pim_beta>0.1 && pim_beta<1.5", "colz");
   TH2F* h2M2 = static_cast<TH2F*>(gDirectory->Get(h2m2_name));
   if (h2M2) {
-    h2M2->SetTitle("Electron: Mass^{2} vs Momentum");
+    h2M2->SetTitle("Mass^{2} vs Momentum (Pion)");
     h2M2->GetXaxis()->SetTitle("Momentum [MeV/c]");
     h2M2->GetYaxis()->SetTitle("Mass^{2} [MeV^{2}/c^{4}]");
   }
 
   // =====================================================
-  // SCANNING PARAMETERS - ELECTRON
-  // Same slice widths as pion: 10, 20, 30, 40 MeV/c
+  // SCANNING PARAMETERS - PION
   // =====================================================
   
-  const double warmupLow = 130.0;       // Warmup fit range [130, 160] MeV/c
-  const double warmupHigh = 160.0;
-  const double startMom = 80.0;         // Anchor point
-  const double transitionMom = 400.0;   // Where Phase 2 doubling starts
-  const double endMom = 1200.0;         // End of fitting (extrapolate beyond)
+  const double warmupLow = 220.0;       // Warmup fit range [220, 400] - always good
+  const double warmupHigh = 280.0;
+  const double startMom = 120.0;        // Anchor point for regular fitting
+  const double transitionMom = 500.0;   // Where Phase 2 doubling starts
+  const double endMom = 1000.0;         // Fit range for pions (extrapolate to 1400)
   const double stepSize = 1.0;          // 1 MeV/c steps in Phase 1
   
   const int nWidths = 4;
-  const double baseWidths[nWidths] = {10.0, 20.0, 30.0, 40.0};  // SAME AS PION
+  const double baseWidths[nWidths] = {10.0, 20.0, 30.0, 40.0};  // Widths for pions
   const TString widthLabels[nWidths] = {"1x(10)", "2x(20)", "3x(30)", "4x(40)"};
   const int widthColors[nWidths] = {kBlue, kRed, kGreen+2, kMagenta};
 
@@ -759,32 +1127,43 @@ void pid_em_cut_pp158_exp() {
     cout << "=== Width " << widthLabels[w] << " (base=" << baseW << " MeV/c) ===" << endl;
     cout << "=============================================" << endl;
 
+    // =====================================================
+    // BUILD ALL SLICES
+    // Phase 0: RIGHT EDGE anchored at startMom (180), width DOUBLES going left
+    // Phase 1: forward from startMom to transitionMom with 1 MeV/c steps
+    // Phase 2: forward from transitionMom with doubling width
+    // =====================================================
+    
     std::vector<double> momLows, momHighs, momCenters, sliceWidths;
     std::vector<int> phaseTag;
 
-    // Phase 0: RIGHT EDGE anchored at startMom, width DOUBLES going left
+    // Phase 0: RIGHT EDGE anchored at startMom (180), width DOUBLES going left
+    // For baseW=5: [175,180], [170,180], [160,180], [140,180], [100,180], [0,180]
+    // Width: 10 → 20 → 40 → 80 → ... until left reaches 0
     std::vector<int> phase0Indices;
     {
-      double pRight = startMom;
+      double pRight = startMom;  // Always 180
       double currentWidth = baseW;
       double pLeft = pRight - currentWidth;
       
       while (pLeft > 0) {
         int idx = momLows.size();
         momLows.push_back(pLeft);
-        momHighs.push_back(pRight);
+        momHighs.push_back(pRight);  // Always startMom (180)
         momCenters.push_back(0.5 * (pLeft + pRight));
         sliceWidths.push_back(pRight - pLeft);
-        phaseTag.push_back(0);
+        phaseTag.push_back(0);  // Phase 0
         phase0Indices.push_back(idx);
         
+        // Double the width for next slice
         currentWidth *= 2.0;
         pLeft = pRight - currentWidth;
       }
       
+      // Final slice from 0 to startMom
       int idx = momLows.size();
       momLows.push_back(0);
-      momHighs.push_back(pRight);
+      momHighs.push_back(pRight);  // 180
       momCenters.push_back(0.5 * pRight);
       sliceWidths.push_back(pRight);
       phaseTag.push_back(0);
@@ -792,7 +1171,7 @@ void pid_em_cut_pp158_exp() {
     }
     int nPhase0 = phase0Indices.size();
 
-    // Phase 1: forward sliding slices
+    // Phase 1: forward sliding slices from startMom
     std::vector<int> phase1Indices;
     {
       double pLeft = startMom;
@@ -809,14 +1188,18 @@ void pid_em_cut_pp158_exp() {
     }
     int nPhase1 = phase1Indices.size();
 
-    // Phase 2: Progressive doubling with sliding
+    // Phase 2: Progressive doubling with sliding windows
+    // - Double width, then slide "previous width" number of 1 MeV/c steps
+    // - This ensures smooth parameter propagation
+    // For baseW=5: [500,510]→slide 5→[505,515], double→[505,525]→slide 10→[515,535], etc.
     std::vector<int> phase2Indices;
     {
-      double pLeft = transitionMom;
-      double prevWidth = baseW;
-      double currentWidth = baseW * 2.0;
+      double pLeft = transitionMom;  // 500
+      double prevWidth = baseW;      // Width at end of Phase 1
+      double currentWidth = baseW * 2.0;  // Start with doubled width
       
       while (pLeft + currentWidth <= endMom) {
+        // Number of 1 MeV/c steps = previous width value
         int nSteps = static_cast<int>(prevWidth);
         
         for (int step = 0; step <= nSteps && pLeft + currentWidth <= endMom; ++step) {
@@ -828,13 +1211,15 @@ void pid_em_cut_pp158_exp() {
           phaseTag.push_back(2);
           phase2Indices.push_back(idx);
           
-          if (step < nSteps) pLeft += stepSize;
+          if (step < nSteps) pLeft += stepSize;  // 1 MeV/c step
         }
         
+        // After sliding, double the width for next round
         prevWidth = currentWidth;
         currentWidth *= 2.0;
       }
       
+      // Final slice to reach endMom if needed
       if (pLeft < endMom && pLeft + prevWidth < endMom) {
         int idx = momLows.size();
         momLows.push_back(pLeft);
@@ -849,6 +1234,7 @@ void pid_em_cut_pp158_exp() {
 
     int nSlices = momLows.size();
     
+    // Print Phase 0 slice structure
     cout << "Phase 0 slices (right edge at " << startMom << ", width doubling):" << endl;
     for (size_t k = 0; k < phase0Indices.size(); ++k) {
       int idx = phase0Indices[k];
@@ -856,14 +1242,33 @@ void pid_em_cut_pp158_exp() {
                    momLows[idx], momHighs[idx], sliceWidths[idx]) << endl;
     }
     
-    cout << "Slices: Phase0=" << nPhase0 << ", Phase1=" << nPhase1 
-         << ", Phase2=" << nPhase2 << ", Total=" << nSlices << endl;
+    cout << "Slices: Phase0=" << nPhase0 << " (width doubling below " << startMom << "), Phase1=" << nPhase1 
+         << " (forward, 1 MeV/c steps), Phase2=" << nPhase2 << " (progressive doubling+sliding), Total=" << nSlices << endl;
+    
+    // Print Phase 2 structure (show transitions)
+    if (nPhase2 > 0) {
+      cout << "Phase 2 structure:" << endl;
+      double lastWidth = 0;
+      for (size_t k = 0; k < phase2Indices.size(); ++k) {
+        int idx = phase2Indices[k];
+        if (sliceWidths[idx] != lastWidth) {
+          cout << Form("  Width %.0f: starting at [%.0f, %.0f]", 
+                       sliceWidths[idx], momLows[idx], momHighs[idx]) << endl;
+          lastWidth = sliceWidths[idx];
+        }
+      }
+    }
 
     allMomCenters[w] = momCenters;
     allFitResults[w].resize(nSlices);
 
     // =====================================================
-    // FIT IN CORRECT ORDER
+    // FIT IN CORRECT ORDER:
+    // 0. WARMUP: [200, 400] - fixed range, always good, get initial params
+    // 1. ANCHOR: First slice of Phase 1 [180, 180+baseW] - use warmup params
+    // 2. Phase 0: width doubling below 180 (right edge at 180), uses warmup params
+    // 3. Rest of Phase 1 forward from anchor to 500
+    // 4. Phase 2 forward with doubling above 500
     // =====================================================
     
     int nSuccess = 0;
@@ -872,8 +1277,8 @@ void pid_em_cut_pp158_exp() {
     PropagatedParams anchorParams;
     anchorParams.valid = false;
     
-    // WARMUP FIT
-    cout << "Fitting WARMUP [" << warmupLow << "," << warmupHigh << "]..." << endl;
+    // Step 0: WARMUP FIT [200, 400] - this always works well!
+    cout << "Fitting WARMUP [" << warmupLow << "," << warmupHigh << "] (fixed range, always good)..." << endl;
     {
       int xbin_lo = h2DB->GetXaxis()->FindFixBin(warmupLow + 0.01);
       int xbin_hi = h2DB->GetXaxis()->FindFixBin(warmupHigh - 0.01);
@@ -885,27 +1290,29 @@ void pid_em_cut_pp158_exp() {
       PropagatedParams noParams;
       noParams.valid = false;
       
+      // Use special warmup parameters - this is a wide, high-statistics slice
       double warmupCenter = 0.5 * (warmupLow + warmupHigh);
       double warmupWidth = warmupHigh - warmupLow;
       
       FitResult warmupResult = tryFitDeltaBeta(proj, fitRangeMin, fitRangeMax, -1, w,
                                                 warmupCenter, warmupLow, warmupHigh, 
-                                                warmupWidth, -1, noParams);
+                                                warmupWidth, -1, noParams);  // phaseTag=-1 for warmup
       delete proj;
       
       if (warmupResult.success) {
         warmupParams = fitResultToProps(warmupResult);
-        cout << Form("  WARMUP OK: μ=%.4f, σ=%.4f, χ²=%.2f", 
+        cout << Form("  WARMUP OK: μ=%.4f, σ=%.4f, χ²=%.2f (will use for all fits)", 
                      warmupResult.mean, warmupResult.sigma, warmupResult.chi2ndf) << endl;
       } else {
-        cout << "  WARMUP FAILED!" << endl;
+        cout << "  WARMUP FAILED! Will try fitting without initial params." << endl;
       }
     }
     
-    // ANCHOR FIT
-    cout << "Fitting ANCHOR at p=" << startMom << "..." << endl;
-    if (phase1Indices.size() > 0) {
+    // Step 1: Fit ANCHOR from Phase 1 [180, 180+baseW] using warmup params
+    if (!phase1Indices.empty()) {
       int anchorIdx = phase1Indices[0];
+      cout << "Fitting ANCHOR [" << momLows[anchorIdx] << "," << momHighs[anchorIdx] 
+           << "] using warmup params..." << endl;
       
       int xbin_lo = h2DB->GetXaxis()->FindFixBin(momLows[anchorIdx] + 0.01);
       int xbin_hi = h2DB->GetXaxis()->FindFixBin(momHighs[anchorIdx] - 0.01);
@@ -914,6 +1321,7 @@ void pid_em_cut_pp158_exp() {
       if (gDirectory->FindObject(projName)) gDirectory->Delete(Form("%s;*", projName.Data()));
       TH1D* proj = h2DB->ProjectionY(projName, xbin_lo, xbin_hi, "e");
       
+      // Use warmup params as starting point
       allFitResults[w][anchorIdx] = tryFitDeltaBeta(proj, fitRangeMin, fitRangeMax, anchorIdx, w,
                                                      momCenters[anchorIdx], momLows[anchorIdx], 
                                                      momHighs[anchorIdx], sliceWidths[anchorIdx], 
@@ -928,13 +1336,13 @@ void pid_em_cut_pp158_exp() {
                      allFitResults[w][anchorIdx].sigma,
                      allFitResults[w][anchorIdx].chi2ndf) << endl;
       } else {
-        cout << "  ANCHOR FAILED!" << endl;
+        cout << "  ANCHOR FAILED! This is unexpected." << endl;
       }
     }
     
-    // Phase 0
-    cout << "Fitting Phase 0..." << endl;
-    PropagatedParams prevParams = warmupParams;
+    // Step 2: Fit Phase 0 using WARMUP parameters (width doubling below 180)
+    cout << "Fitting Phase 0 (width doubling below " << startMom << ", using warmup params)..." << endl;
+    PropagatedParams prevParams = warmupParams;  // USE WARMUP PARAMS DIRECTLY!
     
     for (size_t k = 0; k < phase0Indices.size(); ++k) {
       int i = phase0Indices[k];
@@ -953,16 +1361,33 @@ void pid_em_cut_pp158_exp() {
       if (allFitResults[w][i].success) {
         nSuccess++;
         prevParams = fitResultToProps(allFitResults[w][i]);
+        
+        cout << Form("  P0[%2zu] [%3.0f,%3.0f] w=%3.0f: μ=%7.4f, σ=%6.4f, χ²=%.2f",
+                     k, momLows[i], momHighs[i], sliceWidths[i],
+                     allFitResults[w][i].mean, allFitResults[w][i].sigma,
+                     allFitResults[w][i].chi2ndf) << endl;
+      } else {
+        cout << Form("  P0[%2zu] [%3.0f,%3.0f] w=%3.0f: FAILED (entries=%.0f)",
+                     k, momLows[i], momHighs[i], sliceWidths[i], 
+                     allFitResults[w][i].entries) << endl;
       }
       
       delete proj;
     }
     
-    // Phase 1
-    cout << "Fitting Phase 1..." << endl;
-    prevParams = anchorParams;
+    // Print Phase 0 summary
+    int p0Success = 0;
+    for (size_t k = 0; k < phase0Indices.size(); ++k) {
+      int i = phase0Indices[k];
+      if (allFitResults[w][i].success) p0Success++;
+    }
+    cout << "Phase 0 success: " << p0Success << "/" << nPhase0 << endl;
     
-    for (size_t k = 1; k < phase1Indices.size(); ++k) {
+    // Step 3: Fit rest of Phase 1 FORWARD (skip anchor which is already done)
+    cout << "Fitting Phase 1 (forward from " << startMom << " to " << transitionMom << ")..." << endl;
+    prevParams = anchorParams;  // Restart from anchor
+    
+    for (size_t k = 1; k < phase1Indices.size(); ++k) {  // Start from 1, skip anchor
       int i = phase1Indices[k];
       
       int xbin_lo = h2DB->GetXaxis()->FindFixBin(momLows[i] + 0.01);
@@ -984,10 +1409,11 @@ void pid_em_cut_pp158_exp() {
       delete proj;
     }
     
+    // Get params from end of Phase 1 for Phase 2
     PropagatedParams phase1EndParams = prevParams;
     
-    // Phase 2
-    cout << "Fitting Phase 2..." << endl;
+    // Step 4: Fit Phase 2 FORWARD
+    cout << "Fitting Phase 2 (doubling from " << transitionMom << " to " << endMom << ")..." << endl;
     prevParams = phase1EndParams;
     
     for (size_t k = 0; k < phase2Indices.size(); ++k) {
@@ -1007,6 +1433,13 @@ void pid_em_cut_pp158_exp() {
       if (allFitResults[w][i].success) {
         nSuccess++;
         prevParams = fitResultToProps(allFitResults[w][i]);
+        cout << Form("  P2[%zu] p=[%6.0f,%6.0f] w=%4.0f: μ=%7.4f, σ=%6.4f, χ²=%.2f",
+                     k, momLows[i], momHighs[i], sliceWidths[i],
+                     allFitResults[w][i].mean, allFitResults[w][i].sigma,
+                     allFitResults[w][i].chi2ndf) << endl;
+      } else {
+        cout << Form("  P2[%zu] p=[%6.0f,%6.0f] w=%4.0f: FAIL", 
+                     k, momLows[i], momHighs[i], sliceWidths[i]) << endl;
       }
       
       delete proj;
@@ -1015,22 +1448,29 @@ void pid_em_cut_pp158_exp() {
     cout << "Total success: " << nSuccess << "/" << nSlices << endl;
 
     // =====================================================
-    // SELECT DISPLAY INDICES
+    // SELECT DISPLAY INDICES (after all fits are done)
+    // Show consistent momentum ranges across all widths:
+    // - Phase 0 fits (below 180)
+    // - Representative momenta: ~250, ~350, ~450, ~550, ~700, ~900, ~1100, ~1300
     // =====================================================
     std::vector<int> displayIndices;
     
+    // From Phase 0: show a few (these are the low-momentum wide slices)
     if (nPhase0 > 0) {
-      displayIndices.push_back(phase0Indices[0]);
-      if (nPhase0 > 2) displayIndices.push_back(phase0Indices[nPhase0/2]);
-      displayIndices.push_back(phase0Indices[nPhase0-1]);
+      displayIndices.push_back(phase0Indices[0]);  // First (narrowest)
+      if (nPhase0 > 2) displayIndices.push_back(phase0Indices[nPhase0/2]);  // Middle
+      displayIndices.push_back(phase0Indices[nPhase0-1]);  // Last (widest, includes 0)
     }
     
-    std::vector<double> targetMomenta = {100, 150, 200, 300, 400, 500, 700, 900, 1100};
+    // From Phase 1 & 2: select by target momentum centers
+    // These targets ensure we show similar regions for all widths
+    std::vector<double> targetMomenta = {250, 350, 450, 550, 700, 900, 1100, 1300};
     
     for (double target : targetMomenta) {
       int bestIdx = -1;
       double bestDist = 1e9;
       
+      // Search in Phase 1
       for (size_t k = 0; k < phase1Indices.size(); ++k) {
         int idx = phase1Indices[k];
         double dist = std::abs(momCenters[idx] - target);
@@ -1040,6 +1480,7 @@ void pid_em_cut_pp158_exp() {
         }
       }
       
+      // Search in Phase 2
       for (size_t k = 0; k < phase2Indices.size(); ++k) {
         int idx = phase2Indices[k];
         double dist = std::abs(momCenters[idx] - target);
@@ -1049,22 +1490,24 @@ void pid_em_cut_pp158_exp() {
         }
       }
       
+      // Accept if within 100 MeV/c of target
       if (bestIdx >= 0 && bestDist < 100) {
         displayIndices.push_back(bestIdx);
       }
     }
     
+    // Remove duplicates and limit to 12
     std::sort(displayIndices.begin(), displayIndices.end());
     displayIndices.erase(std::unique(displayIndices.begin(), displayIndices.end()), displayIndices.end());
     if (displayIndices.size() > (size_t)nDisplayPerWidth)
       displayIndices.resize(nDisplayPerWidth);
 
-    cFits[w] = new TCanvas(Form("c_fits_dBeta_em_%d", w), 
-                           Form("Delta-Beta Fits (Electron e^{-}) - %s", widthLabels[w].Data()), 1400, 900);
+    cFits[w] = new TCanvas(Form("c_fits_dBeta_%d", w), 
+                           Form("Delta-Beta Fits (Pion) - %s", widthLabels[w].Data()), 1400, 900);
     cFits[w]->Divide(4, 3);
 
     // =====================================================
-    // DISPLAY FITS - SHOW ALL COMPONENTS
+    // DISPLAY FITS
     // =====================================================
     for (size_t d = 0; d < displayIndices.size() && d < (size_t)nDisplayPerWidth; ++d) {
       int i = displayIndices[d];
@@ -1105,7 +1548,7 @@ void pid_em_cut_pp158_exp() {
       if (result.success && result.polyParams.size() > 0) {
         int nPolyParams = result.polyOrder + 1;
         
-        // Total fit: gaus(0) + gaus(3) + poly at [6]
+        // Build total fit expression: gaus(0) + gaus(3) + poly at [6]
         TString funcExpr = "gaus(0) + gaus(3)";
         for (int pp = 0; pp <= result.polyOrder; ++pp) {
           if (pp == 0) funcExpr += Form(" + [%d]", 6 + pp);
@@ -1125,7 +1568,7 @@ void pid_em_cut_pp158_exp() {
         fitFunc->SetLineWidth(2);
         fitFunc->Draw("same");
 
-        // Signal Gaussian (blue solid)
+        // Signal Gaussian (blue solid, thick)
         TF1* sig = new TF1(Form("sig_db_w%d_d%d", w, (int)d), "gaus", fitRangeMin, fitRangeMax);
         sig->SetParameters(result.amplitude, result.mean, result.sigma);
         sig->SetLineColor(kBlue);
@@ -1133,17 +1576,17 @@ void pid_em_cut_pp158_exp() {
         sig->SetLineWidth(3);
         sig->Draw("same");
 
-        // Background Gaussian (orange dashed)
+        // Background Gaussian (orange dashed) - only draw if amplitude > 0
         if (result.bkgGausAmp > 0.001 * result.amplitude) {
           TF1* bkgGaus = new TF1(Form("bkg_db_w%d_d%d", w, (int)d), "gaus", fitRangeMin, fitRangeMax);
           bkgGaus->SetParameters(result.bkgGausAmp, result.bkgGausMean, result.bkgGausSigma);
-          bkgGaus->SetLineColor(kOrange-1);
+          bkgGaus->SetLineColor(kOrange+1);
           bkgGaus->SetLineStyle(kDashed);
           bkgGaus->SetLineWidth(2);
           bkgGaus->Draw("same");
         }
 
-        // Polynomial (green dashed)
+        // Polynomial (green dashed) - build proper expression
         TString polyExpr;
         for (int pp = 0; pp <= result.polyOrder; ++pp) {
           if (pp == 0) polyExpr = "[0]";
@@ -1158,7 +1601,6 @@ void pid_em_cut_pp158_exp() {
         poly->Draw("same");
       }
 
-      // Labels
       TLatex tex;
       tex.SetNDC();
       tex.SetTextSize(0.034);
@@ -1175,14 +1617,14 @@ void pid_em_cut_pp158_exp() {
         tex.SetTextColor(kBlue);
         tex.DrawLatex(0.55, 0.79, Form("#mu=%.4f", result.mean));
         tex.DrawLatex(0.55, 0.72, Form("#sigma=%.4f", result.sigma));
-        tex.SetTextColor(kOrange-1);
+        tex.SetTextColor(kOrange+1);
         tex.DrawLatex(0.55, 0.65, Form("bkg=%.0f%%", 100.0 * result.bkgGausAmp / result.amplitude));
         tex.SetTextColor(kBlack);
         tex.DrawLatex(0.55, 0.58, Form("pol%d", result.polyOrder));
         if (result.chi2ndf >= 0.3 && result.chi2ndf <= 4.0) {
           tex.SetTextColor(kGreen+2);
         } else {
-          tex.SetTextColor(kOrange-1);
+          tex.SetTextColor(kOrange+1);
         }
         tex.DrawLatex(0.55, 0.51, Form("#chi^{2}/n=%.1f", result.chi2ndf));
         tex.SetTextColor(kBlack);
@@ -1198,14 +1640,13 @@ void pid_em_cut_pp158_exp() {
     }
     cFits[w]->Modified();
     cFits[w]->Update();
-    //cFits[w]->SaveAs(Form("em_fits_%s.png", widthLabels[w].Data()));
   }
 
   // =====================================================
   // CONTOUR PLOTS IN Δβ SPACE
   // =====================================================
   
-  TCanvas* cCombDB_1sig = new TCanvas("c_comb_db_1sig_em", "Combined 1#sigma in #Delta#beta (Electron)", 1000, 800);
+  TCanvas* cCombDB_1sig = new TCanvas("c_comb_db_1sig", "Combined 1#sigma in #Delta#beta (Pion)", 1000, 800);
   cCombDB_1sig->cd();
   h2DB->Draw("colz");
   
@@ -1231,6 +1672,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1238,10 +1680,17 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
-    // Extend to HIGH momentum
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    // Extend to LOW momentum
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
+    
+    // Mean position line (solid, thin)
+    if (!rawP.empty()) {
+      TGraph* gMeanLine = new TGraph(rawP.size(), rawP.data(), smoothMean.data());
+      gMeanLine->SetLineColor(widthColors[w]);
+      gMeanLine->SetLineWidth(2);
+      gMeanLine->SetLineStyle(1);  // Solid for mean
+      gMeanLine->Draw("L");
+    }
     
     std::vector<double> pPoints, dbPoints;
     for (size_t i = 0; i < rawP.size(); ++i) {
@@ -1262,14 +1711,13 @@ void pid_em_cut_pp158_exp() {
       legDB_1->AddEntry(g, Form("%s", widthLabels[w].Data()), "l");
     }
   }
-  legDB_1->AddEntry(zeroLineDB1, "#Delta#beta=0 (e^{-})", "l");
+  legDB_1->AddEntry(zeroLineDB1, "#Delta#beta=0 (pion)", "l");
   legDB_1->Draw();
   cCombDB_1sig->Modified();
   cCombDB_1sig->Update();
-  //cCombDB_1sig->SaveAs("em_contours_db_1sig.png");
 
-  // Combined 3σ in Δβ
-  TCanvas* cCombDB_3sig = new TCanvas("c_comb_db_3sig_em", "Combined 3#sigma in #Delta#beta (Electron)", 1000, 800);
+  // 3σ in Δβ
+  TCanvas* cCombDB_3sig = new TCanvas("c_comb_db_3sig", "Combined 3#sigma in #Delta#beta (Pion)", 1000, 800);
   cCombDB_3sig->cd();
   h2DB->Draw("colz");
   
@@ -1295,6 +1743,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1302,8 +1751,17 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
+    
+    // Mean position line (solid, thin)
+    if (!rawP.empty()) {
+      TGraph* gMeanLine = new TGraph(rawP.size(), rawP.data(), smoothMean.data());
+      gMeanLine->SetLineColor(widthColors[w]);
+      gMeanLine->SetLineWidth(2);
+      gMeanLine->SetLineStyle(1);  // Solid for mean
+      gMeanLine->Draw("L");
+    }
     
     std::vector<double> pPoints, dbPoints;
     for (size_t i = 0; i < rawP.size(); ++i) {
@@ -1324,28 +1782,27 @@ void pid_em_cut_pp158_exp() {
       legDB_3->AddEntry(g, Form("%s", widthLabels[w].Data()), "l");
     }
   }
-  legDB_3->AddEntry(zeroLineDB3, "#Delta#beta=0 (e^{-})", "l");
+  legDB_3->AddEntry(zeroLineDB3, "#Delta#beta=0 (pion)", "l");
   legDB_3->Draw();
   cCombDB_3sig->Modified();
   cCombDB_3sig->Update();
-  //cCombDB_3sig->SaveAs("em_contours_db_3sig.png");
 
   // =====================================================
-  // CONTOUR PLOTS IN (p, β) SPACE
+  // TRANSFORM TO (p, β) SPACE
   // =====================================================
   
-  // Combined 1σ in (p, β)
-  TCanvas* cCombPB_1sig = new TCanvas("c_comb_pb_1sig_em", "Combined 1#sigma in (p, #beta) (Electron)", 1000, 800);
+  // 1σ in (p, β)
+  TCanvas* cCombPB_1sig = new TCanvas("c_comb_pb_1sig", "Combined 1#sigma in (p, #beta) Pion", 1000, 800);
   cCombPB_1sig->cd();
   if (h2PB) h2PB->Draw("colz");
   
-  TF1* emCurvePB1 = new TF1("emCurvePB1", Form("x/sqrt(x*x + %f*%f)", gElectronMass, gElectronMass), 0, gExtendTo);
-  emCurvePB1->SetLineColor(kBlack);
-  emCurvePB1->SetLineStyle(kDashed);
-  emCurvePB1->SetLineWidth(2);
-  emCurvePB1->Draw("same");
+  TF1* pionCurvePB = new TF1("pionCurvePB", "x/sqrt(x*x + 139.57*139.57)", 0, gExtendTo);
+  pionCurvePB->SetLineColor(kBlack);
+  pionCurvePB->SetLineStyle(kDashed);
+  pionCurvePB->SetLineWidth(2);
+  pionCurvePB->Draw("same");
   
-  TLegend* legPB_1 = new TLegend(0.60, 0.15, 0.88, 0.40);
+  TLegend* legPB_1 = new TLegend(0.55, 0.12, 0.88, 0.40);
   legPB_1->SetHeader("1#sigma contours");
 
   for (int w = 0; w < nWidths; ++w) {
@@ -1361,6 +1818,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1368,65 +1826,84 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
     
-    std::vector<double> pPoints1Upper, betaPoints1Upper;
-    std::vector<double> pPoints1Lower, betaPoints1Lower;
+    // Mean position line
+    std::vector<double> pPointsMean, betaPointsMean;
+    for (size_t i = 0; i < rawP.size(); ++i) {
+      double p = rawP[i];
+      double beta_pion = betaPion(p);
+      double beta_mean = beta_pion + smoothMean[i];
+      if (beta_mean > 0.1 && beta_mean < 1.15) {
+        pPointsMean.push_back(p);
+        betaPointsMean.push_back(beta_mean);
+      }
+    }
+    
+    if (!pPointsMean.empty()) {
+      TGraph* gMeanLine = new TGraph(pPointsMean.size(), pPointsMean.data(), betaPointsMean.data());
+      gMeanLine->SetLineColor(widthColors[w]);
+      gMeanLine->SetLineWidth(2);
+      gMeanLine->SetLineStyle(1);  // Solid for mean
+      gMeanLine->Draw("L");
+    }
+    
+    // Upper and lower 1σ bounds
+    std::vector<double> pPointsUpper, betaPointsUpper;
+    std::vector<double> pPointsLower, betaPointsLower;
     
     for (size_t i = 0; i < rawP.size(); ++i) {
       double p = rawP[i];
-      double beta_em = betaElectron(p);
+      double beta_pion = betaPion(p);
       
-      double beta_upper = beta_em + smoothMean[i] + 1.0 * smoothSigma[i];
+      double beta_upper = beta_pion + smoothMean[i] + 1.0 * smoothSigma[i];
       if (beta_upper > 0.1 && beta_upper < 1.15) {
-        pPoints1Upper.push_back(p);
-        betaPoints1Upper.push_back(beta_upper);
+        pPointsUpper.push_back(p);
+        betaPointsUpper.push_back(beta_upper);
       }
       
-      double beta_lower = beta_em + smoothMean[i] - 1.0 * smoothSigma[i];
+      double beta_lower = beta_pion + smoothMean[i] - 1.0 * smoothSigma[i];
       if (beta_lower > 0.1 && beta_lower < 1.15) {
-        pPoints1Lower.push_back(p);
-        betaPoints1Lower.push_back(beta_lower);
+        pPointsLower.push_back(p);
+        betaPointsLower.push_back(beta_lower);
       }
     }
 
-    if (!pPoints1Upper.empty()) {
-      TGraph* gUpper = new TGraph(pPoints1Upper.size(), pPoints1Upper.data(), betaPoints1Upper.data());
+    if (!pPointsUpper.empty()) {
+      TGraph* gUpper = new TGraph(pPointsUpper.size(), pPointsUpper.data(), betaPointsUpper.data());
       gUpper->SetLineColor(widthColors[w]);
       gUpper->SetLineWidth(3);
       gUpper->SetLineStyle(kDashed);
       gUpper->Draw("L");
       legPB_1->AddEntry(gUpper, Form("%s", widthLabels[w].Data()), "l");
     }
-    if (!pPoints1Lower.empty()) {
-      TGraph* gLower = new TGraph(pPoints1Lower.size(), pPoints1Lower.data(), betaPoints1Lower.data());
+    if (!pPointsLower.empty()) {
+      TGraph* gLower = new TGraph(pPointsLower.size(), pPointsLower.data(), betaPointsLower.data());
       gLower->SetLineColor(widthColors[w]);
       gLower->SetLineWidth(3);
       gLower->SetLineStyle(kDashed);
       gLower->Draw("L");
     }
   }
-  legPB_1->AddEntry(emCurvePB1, "m_{e}=0.511", "l");
+  legPB_1->AddEntry(pionCurvePB, "m_{#pi}=139.57", "l");
   legPB_1->Draw();
   cCombPB_1sig->Modified();
   cCombPB_1sig->Update();
-  //cCombPB_1sig->SaveAs("em_contours_pb_1sig.png");
 
-  // Combined 3σ in (p, β)
-  TCanvas* cCombPB_3sig = new TCanvas("c_comb_pb_3sig_em", "Combined 3#sigma in (p, #beta) (Electron)", 1000, 800);
+  // 3σ and 5σ in (p, β)
+  TCanvas* cCombPB_3sig = new TCanvas("c_comb_pb_3sig", "Combined 3#sigma and 5#sigma in (p, #beta) Pion", 1000, 800);
   cCombPB_3sig->cd();
   if (h2PB) h2PB->Draw("colz");
   
-  // Electron β(p) theory curve
-  TF1* emCurvePB3 = new TF1("emCurvePB3", Form("x/sqrt(x*x + %f*%f)", gElectronMass, gElectronMass), 0, gExtendTo);
-  emCurvePB3->SetLineColor(kBlack);
-  emCurvePB3->SetLineStyle(kDashed);
-  emCurvePB3->SetLineWidth(2);
-  emCurvePB3->Draw("same");
+  TF1* pionCurvePB3 = new TF1("pionCurvePB3", "x/sqrt(x*x + 139.57*139.57)", 0, gExtendTo);
+  pionCurvePB3->SetLineColor(kBlack);
+  pionCurvePB3->SetLineStyle(kDashed);
+  pionCurvePB3->SetLineWidth(2);
+  pionCurvePB3->Draw("same");
   
-  TLegend* legPB_3 = new TLegend(0.60, 0.15, 0.88, 0.40);
-  legPB_3->SetHeader("3#sigma contours");
+  TLegend* legPB_3 = new TLegend(0.55, 0.12, 0.88, 0.45);
+  legPB_3->SetHeader("3#sigma (dashed), 5#sigma (long dash)");
 
   for (int w = 0; w < nWidths; ++w) {
     std::vector<double> rawP, rawMean, rawSigma;
@@ -1441,6 +1918,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1448,23 +1926,44 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
     
+    // Mean position line (solid, thin)
+    std::vector<double> pPointsMean, betaPointsMean;
+    for (size_t i = 0; i < rawP.size(); ++i) {
+      double p = rawP[i];
+      double beta_pion = betaPion(p);
+      double beta_mean = beta_pion + smoothMean[i];
+      if (beta_mean > 0.1 && beta_mean < 1.15) {
+        pPointsMean.push_back(p);
+        betaPointsMean.push_back(beta_mean);
+      }
+    }
+    
+    if (!pPointsMean.empty()) {
+      TGraph* gMeanLine = new TGraph(pPointsMean.size(), pPointsMean.data(), betaPointsMean.data());
+      gMeanLine->SetLineColor(widthColors[w]);
+      gMeanLine->SetLineWidth(2);
+      gMeanLine->SetLineStyle(1);  // Solid for mean
+      gMeanLine->Draw("L");
+    }
+    
+    // 3σ bounds (dashed)
     std::vector<double> pPoints3Upper, betaPoints3Upper;
     std::vector<double> pPoints3Lower, betaPoints3Lower;
     
     for (size_t i = 0; i < rawP.size(); ++i) {
       double p = rawP[i];
-      double beta_em = betaElectron(p);
+      double beta_pion = betaPion(p);
       
-      double beta_upper = beta_em + smoothMean[i] + 3.0 * smoothSigma[i];
+      double beta_upper = beta_pion + smoothMean[i] + 3.0 * smoothSigma[i];
       if (beta_upper > 0.1 && beta_upper < 1.15) {
         pPoints3Upper.push_back(p);
         betaPoints3Upper.push_back(beta_upper);
       }
       
-      double beta_lower = beta_em + smoothMean[i] - 3.0 * smoothSigma[i];
+      double beta_lower = beta_pion + smoothMean[i] - 3.0 * smoothSigma[i];
       if (beta_lower > 0.1 && beta_lower < 1.15) {
         pPoints3Lower.push_back(p);
         betaPoints3Lower.push_back(beta_lower);
@@ -1475,7 +1974,7 @@ void pid_em_cut_pp158_exp() {
       TGraph* gUpper = new TGraph(pPoints3Upper.size(), pPoints3Upper.data(), betaPoints3Upper.data());
       gUpper->SetLineColor(widthColors[w]);
       gUpper->SetLineWidth(3);
-      gUpper->SetLineStyle(kDashed);
+      gUpper->SetLineStyle(kDashed);  // Short dashed for 3σ
       gUpper->Draw("L");
       legPB_3->AddEntry(gUpper, Form("%s", widthLabels[w].Data()), "l");
     }
@@ -1486,34 +1985,71 @@ void pid_em_cut_pp158_exp() {
       gLower->SetLineStyle(kDashed);
       gLower->Draw("L");
     }
+    
+    // 5σ bounds (long dashed)
+    std::vector<double> pPoints5Upper, betaPoints5Upper;
+    std::vector<double> pPoints5Lower, betaPoints5Lower;
+    
+    for (size_t i = 0; i < rawP.size(); ++i) {
+      double p = rawP[i];
+      double beta_pion = betaPion(p);
+      
+      double beta_upper = beta_pion + smoothMean[i] + 5.0 * smoothSigma[i];
+      if (beta_upper > 0.1 && beta_upper < 1.15) {
+        pPoints5Upper.push_back(p);
+        betaPoints5Upper.push_back(beta_upper);
+      }
+      
+      double beta_lower = beta_pion + smoothMean[i] - 5.0 * smoothSigma[i];
+      if (beta_lower > 0.1 && beta_lower < 1.15) {
+        pPoints5Lower.push_back(p);
+        betaPoints5Lower.push_back(beta_lower);
+      }
+    }
+
+    if (!pPoints5Upper.empty()) {
+      TGraph* g5Upper = new TGraph(pPoints5Upper.size(), pPoints5Upper.data(), betaPoints5Upper.data());
+      g5Upper->SetLineColor(widthColors[w]);
+      g5Upper->SetLineWidth(2);
+      g5Upper->SetLineStyle(7);  // Long dashed (style 7) for 5σ
+      g5Upper->Draw("L");
+    }
+    if (!pPoints5Lower.empty()) {
+      TGraph* g5Lower = new TGraph(pPoints5Lower.size(), pPoints5Lower.data(), betaPoints5Lower.data());
+      g5Lower->SetLineColor(widthColors[w]);
+      g5Lower->SetLineWidth(2);
+      g5Lower->SetLineStyle(7);  // Long dashed
+      g5Lower->Draw("L");
+    }
   }
-  legPB_3->AddEntry(emCurvePB3, "m_{e}=0.511", "l");
+  legPB_3->AddEntry(pionCurvePB3, "m_{#pi}=139.57", "l");
   legPB_3->Draw();
   cCombPB_3sig->Modified();
   cCombPB_3sig->Update();
-  //cCombPB_3sig->SaveAs("em_contours_pb_3sig.png");
 
   // =====================================================
-  // CONTOUR PLOTS IN (p, mass²) SPACE
+  // TRANSFORM TO (p, mass²) SPACE
   // =====================================================
   
+  // Helper lambda: compute mass² from p and beta
   auto mass2FromPBeta = [](double p, double beta) -> double {
     if (beta <= 0.01 || beta >= 1.5) return -999999;
     return p * p * (1.0 / (beta * beta) - 1.0);
   };
   
-  const double emMass2 = gElectronMass * gElectronMass;  // ~0.26 MeV²/c⁴
+  const double pionMass2 = gPionMass * gPionMass;  // ~19,480 MeV²/c⁴
   
-  // Combined 1σ in (p, mass²)
-  TCanvas* cCombM2_1sig = new TCanvas("c_comb_m2_1sig_em", "Combined 1#sigma in (p, mass^{2}) (Electron)", 1000, 800);
+  // 1σ in (p, mass²)
+  TCanvas* cCombM2_1sig = new TCanvas("c_comb_m2_1sig", "Combined 1#sigma in (p, mass^{2}) Pion", 1000, 800);
   cCombM2_1sig->cd();
   if (h2M2) h2M2->Draw("colz");
   
-  TLine* emLineM2_1 = new TLine(0, emMass2, gExtendTo, emMass2);
-  emLineM2_1->SetLineColor(kBlack);
-  emLineM2_1->SetLineStyle(kDashed);
-  emLineM2_1->SetLineWidth(2);
-  emLineM2_1->Draw("same");
+  // Draw pion mass² line
+  TLine* pionLineM2_1 = new TLine(0, pionMass2, gExtendTo, pionMass2);
+  pionLineM2_1->SetLineColor(kBlack);
+  pionLineM2_1->SetLineStyle(kDashed);
+  pionLineM2_1->SetLineWidth(2);
+  pionLineM2_1->Draw("same");
   
   TLegend* legM2_1 = new TLegend(0.12, 0.60, 0.42, 0.88);
   legM2_1->SetHeader("1#sigma contours");
@@ -1531,6 +2067,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1538,26 +2075,26 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
     
     std::vector<double> pPointsUpper, m2PointsUpper;
     std::vector<double> pPointsLower, m2PointsLower;
     
     for (size_t i = 0; i < rawP.size(); ++i) {
       double p = rawP[i];
-      double beta_em = betaElectron(p);
+      double beta_pion = betaPion(p);
       
-      double beta_upper = beta_em + smoothMean[i] + 1.0 * smoothSigma[i];
+      double beta_upper = beta_pion + smoothMean[i] + 1.0 * smoothSigma[i];
       double m2_upper = mass2FromPBeta(p, beta_upper);
-      if (m2_upper > -50000 && m2_upper < 100000) {
+      if (m2_upper > 0 && m2_upper < 2000000) {
         pPointsUpper.push_back(p);
         m2PointsUpper.push_back(m2_upper);
       }
       
-      double beta_lower = beta_em + smoothMean[i] - 1.0 * smoothSigma[i];
+      double beta_lower = beta_pion + smoothMean[i] - 1.0 * smoothSigma[i];
       double m2_lower = mass2FromPBeta(p, beta_lower);
-      if (m2_lower > -50000 && m2_lower < 100000) {
+      if (m2_lower > 0 && m2_lower < 2000000) {
         pPointsLower.push_back(p);
         m2PointsLower.push_back(m2_lower);
       }
@@ -1577,22 +2114,22 @@ void pid_em_cut_pp158_exp() {
       gLower->Draw("L");
     }
   }
-  legM2_1->AddEntry(emLineM2_1, "m_{e}^{2}=0.26", "l");
+  legM2_1->AddEntry(pionLineM2_1, Form("m_{#pi}^{2}=%.0f", pionMass2), "l");
   legM2_1->Draw();
   cCombM2_1sig->Modified();
   cCombM2_1sig->Update();
-  //cCombM2_1sig->SaveAs("em_contours_m2_1sig.png");
 
-  // Combined 3σ in (p, mass²)
-  TCanvas* cCombM2_3sig = new TCanvas("c_comb_m2_3sig_em", "Combined 3#sigma in (p, mass^{2}) (Electron)", 1000, 800);
+  // 3σ in (p, mass²)
+  TCanvas* cCombM2_3sig = new TCanvas("c_comb_m2_3sig", "Combined 3#sigma in (p, mass^{2}) Pion", 1000, 800);
   cCombM2_3sig->cd();
   if (h2M2) h2M2->Draw("colz");
   
-  TLine* emLineM2 = new TLine(0, emMass2, gExtendTo, emMass2);
-  emLineM2->SetLineColor(kBlack);
-  emLineM2->SetLineStyle(kDashed);
-  emLineM2->SetLineWidth(2);
-  emLineM2->Draw("same");
+  // Draw pion mass² line
+  TLine* pionLineM2_3 = new TLine(0, pionMass2, gExtendTo, pionMass2);
+  pionLineM2_3->SetLineColor(kBlack);
+  pionLineM2_3->SetLineStyle(kDashed);
+  pionLineM2_3->SetLineWidth(2);
+  pionLineM2_3->Draw("same");
   
   TLegend* legM2_3 = new TLegend(0.12, 0.60, 0.42, 0.88);
   legM2_3->SetHeader("3#sigma contours");
@@ -1610,6 +2147,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1617,26 +2155,26 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
     
     std::vector<double> pPointsUpper, m2PointsUpper;
     std::vector<double> pPointsLower, m2PointsLower;
     
     for (size_t i = 0; i < rawP.size(); ++i) {
       double p = rawP[i];
-      double beta_em = betaElectron(p);
+      double beta_pion = betaPion(p);
       
-      double beta_upper = beta_em + smoothMean[i] + 3.0 * smoothSigma[i];
+      double beta_upper = beta_pion + smoothMean[i] + 3.0 * smoothSigma[i];
       double m2_upper = mass2FromPBeta(p, beta_upper);
-      if (m2_upper > -50000 && m2_upper < 100000) {
+      if (m2_upper > 0 && m2_upper < 2000000) {
         pPointsUpper.push_back(p);
         m2PointsUpper.push_back(m2_upper);
       }
       
-      double beta_lower = beta_em + smoothMean[i] - 3.0 * smoothSigma[i];
+      double beta_lower = beta_pion + smoothMean[i] - 3.0 * smoothSigma[i];
       double m2_lower = mass2FromPBeta(p, beta_lower);
-      if (m2_lower > -50000 && m2_lower < 100000) {
+      if (m2_lower > 0 && m2_lower < 2000000) {
         pPointsLower.push_back(p);
         m2PointsLower.push_back(m2_lower);
       }
@@ -1656,26 +2194,24 @@ void pid_em_cut_pp158_exp() {
       gLower->Draw("L");
     }
   }
-  legM2_3->AddEntry(emLineM2, "m_{e}^{2}=0.26", "l");
+  legM2_3->AddEntry(pionLineM2_3, Form("m_{#pi}^{2}=%.0f", pionMass2), "l");
   legM2_3->Draw();
   cCombM2_3sig->Modified();
   cCombM2_3sig->Update();
-  //cCombM2_3sig->SaveAs("em_contours_m2_3sig.png");
 
   // =====================================================
-  // CONTOUR PLOTS IN (mass, a) SPACE
+  // TRANSFORM TO (mass, a) SPACE
   // =====================================================
   
-  // Combined 1σ in (mass, a)
-  TCanvas* cCombMA_1sig = new TCanvas("c_comb_ma_1sig_em", "Combined 1#sigma in (mass, a) (Electron)", 1000, 800);
+  TCanvas* cCombMA_1sig = new TCanvas("c_comb_ma_1sig", "Combined 1#sigma in (mass, a) Pion", 1000, 800);
   cCombMA_1sig->cd();
   if (h2MA) h2MA->Draw("colz");
   
-  TLine* emLineMA_1 = new TLine(gElectronMass, 0, gElectronMass, 16);
-  emLineMA_1->SetLineColor(kBlack);
-  emLineMA_1->SetLineStyle(kDashed);
-  emLineMA_1->SetLineWidth(2);
-  emLineMA_1->Draw("same");
+  TLine* pionLineMA = new TLine(gPionMass, 0, gPionMass, 16);
+  pionLineMA->SetLineColor(kBlack);
+  pionLineMA->SetLineStyle(kDashed);
+  pionLineMA->SetLineWidth(2);
+  pionLineMA->Draw("same");
   
   TLegend* legMA_1 = new TLegend(0.60, 0.55, 0.88, 0.88);
   legMA_1->SetHeader("1#sigma contours");
@@ -1693,6 +2229,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1700,31 +2237,31 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
     
     std::vector<double> massPointsUpper, aPointsUpper;
     std::vector<double> massPointsLower, aPointsLower;
     
     for (size_t i = 0; i < rawP.size(); ++i) {
       double p = rawP[i];
-      double beta_em = betaElectron(p);
+      double beta_pion = betaPion(p);
       
-      double beta_upper = beta_em + smoothMean[i] + 1.0 * smoothSigma[i];
+      double beta_upper = beta_pion + smoothMean[i] + 1.0 * smoothSigma[i];
       double mass_u, a_u;
       if (beta_upper > 0.1 && beta_upper < 1.5) {
         if (pBetaToMassA(p, beta_upper, gSSquared, mass_u, a_u) && 
-            mass_u > -50 && mass_u < 300 && a_u > 0 && a_u < 16) {
+            mass_u > 0 && mass_u < 2000 && a_u > 0 && a_u < 16) {
           massPointsUpper.push_back(mass_u);
           aPointsUpper.push_back(a_u);
         }
       }
       
-      double beta_lower = beta_em + smoothMean[i] - 1.0 * smoothSigma[i];
+      double beta_lower = beta_pion + smoothMean[i] - 1.0 * smoothSigma[i];
       double mass_l, a_l;
       if (beta_lower > 0.1 && beta_lower < 1.5) {
         if (pBetaToMassA(p, beta_lower, gSSquared, mass_l, a_l) && 
-            mass_l > -50 && mass_l < 300 && a_l > 0 && a_l < 16) {
+            mass_l > 0 && mass_l < 2000 && a_l > 0 && a_l < 16) {
           massPointsLower.push_back(mass_l);
           aPointsLower.push_back(a_l);
         }
@@ -1745,22 +2282,21 @@ void pid_em_cut_pp158_exp() {
       gLower->Draw("L");
     }
   }
-  legMA_1->AddEntry(emLineMA_1, "m_{e}=0.511", "l");
+  legMA_1->AddEntry(pionLineMA, "m_{#pi}=139.57", "l");
   legMA_1->Draw();
   cCombMA_1sig->Modified();
   cCombMA_1sig->Update();
-  //cCombMA_1sig->SaveAs("em_contours_ma_1sig.png");
 
-  // Combined 3σ in (mass, a)
-  TCanvas* cCombMA_3sig = new TCanvas("c_comb_ma_3sig_em", "Combined 3#sigma in (mass, a) (Electron)", 1000, 800);
+  // 3σ in (mass, a)
+  TCanvas* cCombMA_3sig = new TCanvas("c_comb_ma_3sig", "Combined 3#sigma in (mass, a) Pion", 1000, 800);
   cCombMA_3sig->cd();
   if (h2MA) h2MA->Draw("colz");
   
-  TLine* emLineMA = new TLine(gElectronMass, 0, gElectronMass, 16);
-  emLineMA->SetLineColor(kBlack);
-  emLineMA->SetLineStyle(kDashed);
-  emLineMA->SetLineWidth(2);
-  emLineMA->Draw("same");
+  TLine* pionLineMA3 = new TLine(gPionMass, 0, gPionMass, 16);
+  pionLineMA3->SetLineColor(kBlack);
+  pionLineMA3->SetLineStyle(kDashed);
+  pionLineMA3->SetLineWidth(2);
+  pionLineMA3->Draw("same");
   
   TLegend* legMA_3 = new TLegend(0.60, 0.55, 0.88, 0.88);
   legMA_3->SetHeader("3#sigma contours");
@@ -1778,6 +2314,7 @@ void pid_em_cut_pp158_exp() {
     
     if (rawP.size() < 5) continue;
     
+    // CRITICAL: Sort by momentum before smoothing!
     sortByMomentum(rawP, rawMean, rawSigma);
     
     int medWin = (w == 0) ? 7 : (w == 1) ? 5 : 3;
@@ -1785,31 +2322,31 @@ void pid_em_cut_pp158_exp() {
     std::vector<double> smoothMean = robustSmooth(rawMean, medWin, gaussWin);
     std::vector<double> smoothSigma = robustSmooth(rawSigma, medWin, gaussWin);
     
+    // EXTEND TO 1400 MeV/c (constant extrapolation from last fit values)
     extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 20.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
     
     std::vector<double> massPointsUpper, aPointsUpper;
     std::vector<double> massPointsLower, aPointsLower;
     
     for (size_t i = 0; i < rawP.size(); ++i) {
       double p = rawP[i];
-      double beta_em = betaElectron(p);
+      double beta_pion = betaPion(p);
       
-      double beta_upper = beta_em + smoothMean[i] + 3.0 * smoothSigma[i];
+      double beta_upper = beta_pion + smoothMean[i] + 3.0 * smoothSigma[i];
       double mass_u, a_u;
       if (beta_upper > 0.1 && beta_upper < 1.5) {
         if (pBetaToMassA(p, beta_upper, gSSquared, mass_u, a_u) && 
-            mass_u > -50 && mass_u < 300 && a_u > 0 && a_u < 16) {
+            mass_u > 0 && mass_u < 2000 && a_u > 0 && a_u < 16) {
           massPointsUpper.push_back(mass_u);
           aPointsUpper.push_back(a_u);
         }
       }
       
-      double beta_lower = beta_em + smoothMean[i] - 3.0 * smoothSigma[i];
+      double beta_lower = beta_pion + smoothMean[i] - 3.0 * smoothSigma[i];
       double mass_l, a_l;
       if (beta_lower > 0.1 && beta_lower < 1.5) {
         if (pBetaToMassA(p, beta_lower, gSSquared, mass_l, a_l) && 
-            mass_l > -50 && mass_l < 300 && a_l > 0 && a_l < 16) {
+            mass_l > 0 && mass_l < 2000 && a_l > 0 && a_l < 16) {
           massPointsLower.push_back(mass_l);
           aPointsLower.push_back(a_l);
         }
@@ -1830,17 +2367,16 @@ void pid_em_cut_pp158_exp() {
       gLower->Draw("L");
     }
   }
-  legMA_3->AddEntry(emLineMA, "m_{e}=0.511", "l");
+  legMA_3->AddEntry(pionLineMA3, "m_{#pi}=139.57", "l");
   legMA_3->Draw();
   cCombMA_3sig->Modified();
   cCombMA_3sig->Update();
-  //cCombMA_3sig->SaveAs("em_contours_ma_3sig.png");
 
   // =====================================================
   // PARAMETER PLOTS
   // =====================================================
   
-  TCanvas* cPar = new TCanvas("c_par_em", "Fit Parameters vs Momentum (Electron)", 1200, 800);
+  TCanvas* cPar = new TCanvas("c_par", "Fit Parameters vs Momentum (Pion)", 1200, 800);
   cPar->Divide(2, 2);
 
   // Mean
@@ -1892,13 +2428,38 @@ void pid_em_cut_pp158_exp() {
     mgSigma->Add(g, "P");
     legSigma->AddEntry(g, widthLabels[w], "p");
   }
-  mgSigma->SetTitle("Sigma #Delta#beta vs Momentum;p [MeV/c];#sigma (#Delta#beta)");
+  mgSigma->SetTitle("Width #sigma vs Momentum;p [MeV/c];#sigma (#Delta#beta)");
   mgSigma->Draw("A");
-  mgSigma->GetYaxis()->SetRangeUser(0.0, 0.05);
   legSigma->Draw();
 
-  // Chi2
+  // Background Gauss fraction
   cPar->cd(3);
+  gPad->SetLeftMargin(0.14);
+  TMultiGraph* mgBkg = new TMultiGraph();
+  TLegend* legBkg = new TLegend(0.55, 0.70, 0.88, 0.88);
+  for (int w = 0; w < nWidths; ++w) {
+    TGraph* g = new TGraph();
+    int np = 0;
+    for (size_t i = 0; i < allFitResults[w].size(); ++i) {
+      if (allFitResults[w][i].success && allFitResults[w][i].amplitude > 0) {
+        double frac = 100.0 * allFitResults[w][i].bkgGausAmp / allFitResults[w][i].amplitude;
+        g->SetPoint(np++, allMomCenters[w][i], frac);
+      }
+    }
+    g->SetMarkerStyle(20);
+    g->SetMarkerSize(0.3);
+    g->SetMarkerColor(widthColors[w]);
+    g->SetLineColor(widthColors[w]);
+    mgBkg->Add(g, "P");
+    legBkg->AddEntry(g, widthLabels[w], "p");
+  }
+  mgBkg->SetTitle("Background Gauss Fraction;p [MeV/c];Bkg/Signal [%]");
+  mgBkg->Draw("A");
+  mgBkg->GetYaxis()->SetRangeUser(0, 40);
+  legBkg->Draw();
+
+  // Chi2/ndf
+  cPar->cd(4);
   gPad->SetLeftMargin(0.14);
   TMultiGraph* mgChi2 = new TMultiGraph();
   TLegend* legChi2 = new TLegend(0.55, 0.70, 0.88, 0.88);
@@ -1906,7 +2467,7 @@ void pid_em_cut_pp158_exp() {
     TGraph* g = new TGraph();
     int np = 0;
     for (size_t i = 0; i < allFitResults[w].size(); ++i) {
-      if (allFitResults[w][i].success && allFitResults[w][i].chi2ndf < 20) {
+      if (allFitResults[w][i].success) {
         g->SetPoint(np++, allMomCenters[w][i], allFitResults[w][i].chi2ndf);
       }
     }
@@ -1919,308 +2480,104 @@ void pid_em_cut_pp158_exp() {
   }
   mgChi2->SetTitle("#chi^{2}/ndf vs Momentum;p [MeV/c];#chi^{2}/ndf");
   mgChi2->Draw("A");
-  mgChi2->GetYaxis()->SetRangeUser(0.0, 10.0);
-  TLine* chi2Line1 = new TLine(0, 1, gExtendTo, 1);
-  chi2Line1->SetLineColor(kGreen+2);
-  chi2Line1->SetLineStyle(kDashed);
-  chi2Line1->Draw("same");
+  mgChi2->GetYaxis()->SetRangeUser(0, 5);
+  TLine* chi2Line = new TLine(0, 1, gExtendTo, 1);
+  chi2Line->SetLineColor(kRed);
+  chi2Line->SetLineStyle(kDashed);
+  chi2Line->Draw("same");
   legChi2->Draw();
 
-  // Entries
-  cPar->cd(4);
-  gPad->SetLeftMargin(0.14);
-  gPad->SetLogy();
-  TMultiGraph* mgEnt = new TMultiGraph();
-  TLegend* legEnt = new TLegend(0.55, 0.70, 0.88, 0.88);
-  for (int w = 0; w < nWidths; ++w) {
-    TGraph* g = new TGraph();
-    int np = 0;
-    for (size_t i = 0; i < allFitResults[w].size(); ++i) {
-      if (allFitResults[w][i].success) {
-        g->SetPoint(np++, allMomCenters[w][i], allFitResults[w][i].entries);
-      }
-    }
-    g->SetMarkerStyle(20);
-    g->SetMarkerSize(0.3);
-    g->SetMarkerColor(widthColors[w]);
-    g->SetLineColor(widthColors[w]);
-    mgEnt->Add(g, "P");
-    legEnt->AddEntry(g, widthLabels[w], "p");
-  }
-  mgEnt->SetTitle("Entries vs Momentum;p [MeV/c];Entries");
-  mgEnt->Draw("A");
-  legEnt->Draw();
-
-  cPar->Modified();
-  cPar->Update();
-  //cPar->SaveAs("em_parameters.png");
-
   // =====================================================
-  // GENERATE TCutG AND FINAL VISUALIZATION
+  // SAVE OUTPUT
   // =====================================================
   
-  // Use width index 1 (20 MeV/c) as default - best balance
+  //for (int w = 0; w < nWidths; ++w) {
+  //  cFits[w]->SaveAs(Form("pion_fits_dBeta_%s.png", widthLabels[w].Data()));
+  //}
+  //cCombDB_1sig->SaveAs("pion_dBeta_combined_1sigma.png");
+  //cCombDB_3sig->SaveAs("pion_dBeta_combined_3sigma.png");
+  //cCombPB_1sig->SaveAs("pion_pbeta_combined_1sigma.png");
+  //cCombPB_3sig->SaveAs("pion_pbeta_combined_3sigma.png");
+  //cCombM2_1sig->SaveAs("pion_mass2_combined_1sigma.png");
+  //cCombM2_3sig->SaveAs("pion_mass2_combined_3sigma.png");
+  //cCombMA_1sig->SaveAs("pion_massa_combined_1sigma.png");
+  //cCombMA_3sig->SaveAs("pion_massa_combined_3sigma.png");
+  //cPar->SaveAs("pion_parameters_dBeta.png");
+
+  // Output file
+  /*
+  std::ofstream outfile("pion_fit_results_dBeta.txt");
+  outfile << "Width\tpCenter\tpLow\tpHigh\tPhase\tMean_dBeta\tSigma_dBeta\tBkgFrac[%]\tChi2NDF\tStatus" << std::endl;
+  for (int w = 0; w < nWidths; ++w) {
+    for (size_t i = 0; i < allMomCenters[w].size(); ++i) {
+      FitResult& r = allFitResults[w][i];
+      TString phaseStr = (r.phaseTag == 0) ? "BWD" : ((r.phaseTag == 1) ? "FWD" : "DBL");
+      double bkgFrac = (r.amplitude > 0) ? 100.0 * r.bkgGausAmp / r.amplitude : 0;
+      outfile << widthLabels[w] << "\t" << r.pCenter << "\t" << r.pLow << "\t" << r.pHigh << "\t"
+              << phaseStr << "\t" << r.mean << "\t" << r.sigma << "\t" << bkgFrac << "\t" << r.chi2ndf << "\t"
+              << (r.success ? "OK" : "FAIL") << std::endl;
+    }
+  }
+  outfile.close();
+  */
+  // =====================================================
+  // TCutG GENERATION AND SAVING
+  // =====================================================
+  
+  // Use width 1 (2x) for final contours - typically best balance
   int selectedWidth = 1;
   
-  std::vector<double> rawP, rawMean, rawSigma;
-  for (size_t i = 0; i < allFitResults[selectedWidth].size(); ++i) {
-    if (allFitResults[selectedWidth][i].success) {
-      rawP.push_back(allMomCenters[selectedWidth][i]);
-      rawMean.push_back(allFitResults[selectedWidth][i].mean);
-      rawSigma.push_back(allFitResults[selectedWidth][i].sigma);
-    }
+  ContourOutput contours = generateSmoothedCuts(
+      allFitResults[selectedWidth],
+      allMomCenters[selectedWidth],
+      selectedWidth,
+      gPionMass,
+      50.0,                              // pMin
+      gExtendTo,                         // pMax (1400 MeV/c)
+      5.0,                               // pStep
+      "pim",                             // particleName
+      "pim_p",                           // varNameX
+      "pim_beta",                        // varNameY
+      7,                                 // medianWindow
+      9,                                 // gaussWindow
+      gExtendTo                          // extendHighTo
+  );
+  
+  if (contours.valid) {
+    saveContourResults(
+        contours,
+        allFitResults,
+        allMomCenters,
+        widthLabels,
+        nWidths,
+        "pim_pid_cuts_pp158_exp.root",              // Output filename
+        "pim"                             // Particle name
+    );
+    
+    // Draw TCutG overlay on (p, beta) histogram
+    TCanvas* cCuts = drawCutsOnHistogram(h2PB, contours, "c_pim_cuts", gPionMass);
+    //if (cCuts) {
+    //  cCuts->SaveAs("pim_pid_cuts_overlay_pp158_exp.png");
+    //}
   }
-  
-  // TCutG objects for visualization and saving
-  TCutG* cut1sig = nullptr;
-  TCutG* cut25sig = nullptr;
-  TCutG* cut3sig = nullptr;
-  TCutG* cut35sig = nullptr;
-  TCutG* cut5sig = nullptr;
-  
-  TGraph* meanGraph = nullptr;
-  TGraph* sigmaGraph = nullptr;
-  TSpline3* meanSpline = nullptr;
-  TSpline3* sigmaSpline = nullptr;
-  
-  if (rawP.size() >= 5) {
-    sortByMomentum(rawP, rawMean, rawSigma);
-    
-    std::vector<double> smoothMean = robustSmooth(rawMean, 7, 9);
-    std::vector<double> smoothSigma = robustSmooth(rawSigma, 7, 9);
-    
-    // Extend to high and low momentum
-    extendToMomentum(rawP, smoothMean, smoothSigma, gExtendTo, 10.0, 5);
-    extendToLowMomentum(rawP, smoothMean, smoothSigma, gExtendLow, 5.0, 5);
-    
-    // Create TGraphs and TSplines for smoothed parameters
-    meanGraph = new TGraph(rawP.size(), rawP.data(), smoothMean.data());
-    meanGraph->SetName("gr_mean_deltabeta");
-    meanGraph->SetTitle("Smoothed Mean #Delta#beta vs p");
-    
-    sigmaGraph = new TGraph(rawP.size(), rawP.data(), smoothSigma.data());
-    sigmaGraph->SetName("gr_sigma_deltabeta");
-    sigmaGraph->SetTitle("Smoothed Sigma #Delta#beta vs p");
-    
-    meanSpline = new TSpline3("spl_mean_deltabeta", meanGraph);
-    sigmaSpline = new TSpline3("spl_sigma_deltabeta", sigmaGraph);
-    
-    // Lambda to generate TCutG for a given sigma level
-    auto makeCut = [&](double nSig, const char* cutName) -> TCutG* {
-      std::vector<double> pCut, betaCut;
-      
-      // Upper boundary (forward)
-      for (size_t i = 0; i < rawP.size(); ++i) {
-        double p = rawP[i];
-        if (p < 0) continue;
-        double beta_em = betaElectron(p);
-        double beta_upper = beta_em + smoothMean[i] + nSig * smoothSigma[i];
-        if (beta_upper > 0.01 && beta_upper < 1.5) {
-          pCut.push_back(p);
-          betaCut.push_back(beta_upper);
-        }
-      }
-      
-      // Lower boundary (backward)
-      for (int i = rawP.size() - 1; i >= 0; --i) {
-        double p = rawP[i];
-        if (p < 0) continue;
-        double beta_em = betaElectron(p);
-        double beta_lower = beta_em + smoothMean[i] - nSig * smoothSigma[i];
-        if (beta_lower > 0.01 && beta_lower < 1.5) {
-          pCut.push_back(p);
-          betaCut.push_back(beta_lower);
-        }
-      }
-      
-      // Close polygon
-      if (!pCut.empty()) {
-        pCut.push_back(pCut[0]);
-        betaCut.push_back(betaCut[0]);
-      }
-      
-      TCutG* cut = new TCutG(cutName, pCut.size(), pCut.data(), betaCut.data());
-      cut->SetVarX("em_p");
-      cut->SetVarY("em_beta");
-      return cut;
-    };
-    
-    // Generate all TCutG objects
-    cut1sig  = makeCut(1.0, "cut_em_1sig");
-    cut25sig = makeCut(2.5, "cut_em_25sig");
-    cut3sig  = makeCut(3.0, "cut_em_3sig");
-    cut35sig = makeCut(3.5, "cut_em_35sig");
-    cut5sig  = makeCut(5.0, "cut_em_5sig");
-    
-    // Set visual properties for display (1σ, 3σ, 5σ)
-    cut1sig->SetLineColor(kRed);
-    cut1sig->SetLineWidth(3);
-    cut1sig->SetLineStyle(kSolid);
-    
-    cut3sig->SetLineColor(kBlue);
-    cut3sig->SetLineWidth(3);
-    cut3sig->SetLineStyle(kDashed);
-    
-    cut5sig->SetLineColor(kGreen+2);
-    cut5sig->SetLineWidth(3);
-    cut5sig->SetLineStyle(7);  // Long dashed
-    
-    cout << "[TCutG] Generated cuts: " << cut1sig->GetN() << " points each" << endl;
-  }
-  
-  // =====================================================
-  // FINAL CANVAS: TCutG ON (p, β) HISTOGRAM
-  // Display: 1σ, 3σ, 5σ
-  // =====================================================
-  
-  TCanvas* cCuts = new TCanvas("c_em_cuts", "Electron PID Cuts in (p, #beta)", 1000, 800);
-  cCuts->cd();
-  
-  if (h2PB) h2PB->Draw("colz");
-  
-  // Theory curve: β = p/√(p² + m²)
-  TF1* theoryCurve = new TF1("theoryCurve_em", 
-    Form("x/sqrt(x*x + %f*%f)", gElectronMass, gElectronMass), 0, gExtendTo);
-  theoryCurve->SetLineColor(kBlack);
-  theoryCurve->SetLineStyle(kDashed);
-  theoryCurve->SetLineWidth(2);
-  theoryCurve->Draw("same");
-  
-  // Draw TCutG (1σ, 3σ, 5σ)
-  if (cut1sig) cut1sig->Draw("L same");
-  if (cut3sig) cut3sig->Draw("L same");
-  if (cut5sig) cut5sig->Draw("L same");
-  
-  TLegend* legCuts = new TLegend(0.55, 0.15, 0.88, 0.40);
-  legCuts->SetHeader(Form("Electron e^{-} (width %s)", widthLabels[selectedWidth].Data()));
-  if (cut1sig) legCuts->AddEntry(cut1sig, "1#sigma", "l");
-  if (cut3sig) legCuts->AddEntry(cut3sig, "3#sigma", "l");
-  if (cut5sig) legCuts->AddEntry(cut5sig, "5#sigma", "l");
-  legCuts->AddEntry(theoryCurve, Form("m_{e}=%.3f MeV", gElectronMass), "l");
-  legCuts->Draw();
-  
-  cCuts->Modified();
-  cCuts->Update();
-  //cCuts->SaveAs("em_pid_cuts_overlay.png");
-  
-  // =====================================================
-  // SAVE TO ROOT FILE
-  // Store: 1σ, 2.5σ, 3σ, 3.5σ, 5σ
-  // =====================================================
-  
-  TFile* fOut = new TFile("em_pid_cuts_exp.root", "RECREATE");
-  
-  // Save raw fit results as TTree
-  TTree* tree = new TTree("FitResults", "Raw PID fit results in DeltaBeta representation");
-  
-  Double_t t_p, t_pLow, t_pHigh, t_mean, t_sigma, t_chi2, t_sliceWidth;
-  Int_t t_widthIdx, t_phaseTag, t_success;
-  
-  tree->Branch("p_center",    &t_p);
-  tree->Branch("p_low",       &t_pLow);
-  tree->Branch("p_high",      &t_pHigh);
-  tree->Branch("delta_beta_mean",  &t_mean);
-  tree->Branch("delta_beta_sigma", &t_sigma);
-  tree->Branch("chi2ndf",     &t_chi2);
-  tree->Branch("slice_width", &t_sliceWidth);
-  tree->Branch("width_idx",   &t_widthIdx);
-  tree->Branch("phase_tag",   &t_phaseTag);
-  tree->Branch("success",     &t_success);
-  
-  for (int w = 0; w < nWidths; ++w) {
-    for (size_t i = 0; i < allFitResults[w].size(); ++i) {
-      const FitResult& r = allFitResults[w][i];
-      t_p = r.pCenter;
-      t_pLow = r.pLow;
-      t_pHigh = r.pHigh;
-      t_mean = r.mean;
-      t_sigma = r.sigma;
-      t_chi2 = r.chi2ndf;
-      t_sliceWidth = r.sliceWidth;
-      t_widthIdx = w;
-      t_phaseTag = r.phaseTag;
-      t_success = r.success ? 1 : 0;
-      tree->Fill();
-    }
-  }
-  tree->Write();
-  cout << "  - TTree 'FitResults' with " << tree->GetEntries() << " entries" << endl;
-  
-  // Save contour graphs and splines
-  if (meanGraph && sigmaGraph && meanSpline && sigmaSpline) {
-    TDirectory* dirContours = fOut->mkdir("Contours");
-    dirContours->cd();
-    
-    meanGraph->Write();
-    sigmaGraph->Write();
-    meanSpline->Write();
-    sigmaSpline->Write();
-    
-    cout << "  - Smoothed TGraphs and TSpline3 objects" << endl;
-  }
-  
-  // Save TCutG objects (ALL 5 levels)
-  if (cut1sig && cut25sig && cut3sig && cut35sig && cut5sig) {
-    TDirectory* dirCuts = fOut->mkdir("TCutG");
-    dirCuts->cd();
-    
-    cut1sig->Write();
-    cut25sig->Write();
-    cut3sig->Write();
-    cut35sig->Write();
-    cut5sig->Write();
-    
-    cout << "  - TCutG objects: cut_em_1sig, cut_em_25sig, cut_em_3sig, cut_em_35sig, cut_em_5sig" << endl;
-  }
-  
-  // Save metadata
-  fOut->cd();
-  TNamed* metaParticle = new TNamed("particle", "electron");
-  TNamed* metaMass = new TNamed("mass_MeV", Form("%.3f", gElectronMass));
-  TNamed* metaWidth = new TNamed("selected_width", Form("%d", selectedWidth));
-  TNamed* metaWidthLabel = new TNamed("width_label", widthLabels[selectedWidth].Data());
-  metaParticle->Write();
-  metaMass->Write();
-  metaWidth->Write();
-  metaWidthLabel->Write();
-  
-  fOut->Close();
-  delete fOut;
-  
-  cout << "[TCutG] Output file 'em_pid_cuts_exp.root' saved successfully." << endl;
 
-  // =====================================================
-  // SUMMARY
-  // =====================================================
-  cout << "\n=========================================" << endl;
-  cout << "=== ELECTRON PID ANALYSIS COMPLETE ===" << endl;
-  cout << "=========================================" << endl;
-  cout << "Particle: e- (electron), mass = " << gElectronMass << " MeV/c²" << endl;
-  cout << "Slice widths: 10, 20, 30, 40 MeV/c (same as pion)" << endl;
-  cout << "Warmup range: [" << warmupLow << ", " << warmupHigh << "] MeV/c" << endl;
-  cout << "TCutG extended from p=" << gExtendLow << " to p=" << gExtendTo << " MeV/c" << endl;
-  cout << "\nROBUST FIT MODEL:" << endl;
+  cout << "\n=== PION (pi+) Analysis Complete ===" << endl;
+  cout << "ROBUST FIT MODEL:" << endl;
   cout << "  1. Find peak max and 80% boundaries" << endl;
   cout << "  2. Preliminary Gauss fit to peak top (anchors position)" << endl;
   cout << "  3. Full fit: Signal Gauss + Bkg Gauss + Polynomial" << endl;
   cout << "  4. Subtract polynomial and bkg Gauss from data" << endl;
   cout << "  5. Final Gauss fit to cleaned data - USED FOR CONTOURS" << endl;
-  cout << "\nOutput files:" << endl;
-  for (int w = 0; w < nWidths; ++w) {
-    cout << "  - em_fits_" << widthLabels[w] << ".png" << endl;
-  }
-  cout << "  - em_contours_db_1sig.png  (Δβ, 1σ)" << endl;
-  cout << "  - em_contours_db_3sig.png  (Δβ, 3σ)" << endl;
-  cout << "  - em_contours_pb_1sig.png  (p,β, 1σ)" << endl;
-  cout << "  - em_contours_pb_3sig.png  (p,β, 3σ)" << endl;
-  cout << "  - em_contours_m2_1sig.png  (p,m², 1σ)" << endl;
-  cout << "  - em_contours_m2_3sig.png  (p,m², 3σ)" << endl;
-  cout << "  - em_contours_ma_1sig.png  (m,a, 1σ)" << endl;
-  cout << "  - em_contours_ma_3sig.png  (m,a, 3σ)" << endl;
-  cout << "  - em_parameters.png" << endl;
-  cout << "  - em_pid_cuts_overlay.png  <-- TCutG (1σ, 3σ, 5σ) on (p, β)" << endl;
-  cout << "  - em_pid_cuts_exp.root:" << endl;
-  cout << "      * FitResults TTree" << endl;
-  cout << "      * Contours/ (TGraphs, TSplines)" << endl;
-  cout << "      * TCutG/ (1σ, 2.5σ, 3σ, 3.5σ, 5σ)" << endl;
+  cout << "\nScanning strategy:" << endl;
+  cout << "  Warmup: [" << warmupLow << ", " << warmupHigh << "] MeV/c" << endl;
+  cout << "  Anchor: " << startMom << " MeV/c" << endl;
+  cout << "  Phase 0: right edge at " << startMom << ", width doubling to 0" << endl;
+  cout << "  Phase 1: forward from " << startMom << " to " << transitionMom << " MeV/c (" << stepSize << " MeV/c steps)" << endl;
+  cout << "  Phase 2: above " << transitionMom << " MeV/c - progressive doubling with sliding" << endl;
+  cout << "           (double width, then slide prev_width steps of 1 MeV/c each)" << endl;
+  cout << "\n=== TCutG OUTPUT ===" << endl;
+  cout << "  ROOT file: pim_pid_cuts_exp.root" << endl;
+  cout << "  Contains: FitResults TTree, Contours/, TCutG/" << endl;
+  cout << "  TCutG extended to " << gExtendTo << " MeV/c" << endl;
+  cout << "\nOutput files saved." << endl;
 }

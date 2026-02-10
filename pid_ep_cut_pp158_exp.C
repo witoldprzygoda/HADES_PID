@@ -1,4 +1,4 @@
-// pid_ep_cut_pp45_exp.C
+	// pid_ep_cut_pp158_exp.C
 // POSITRON (e+) PID analysis using Δβ = β_measured - β_positron(p) representation
 // 
 // Adapted from pid_pip_cut_pp45_exp.C for HADES experiment
@@ -59,7 +59,7 @@ using std::cout; using std::endl;
 // =====================================================
 const double gPositronMass = 0.511;   // MeV/c² - electron/positron mass
 const double gSSquared = 1e-4;        // For (mass, a) transformation
-const double gExtendTo = 1600.0;      // Extend contours to this momentum [MeV/c]
+const double gExtendTo = 1400.0;      // Extend contours to this momentum [MeV/c]
 const double gExtendLow = 10.0;       // Extend contours down to this momentum [MeV/c] (avoid distortion at 0)
 
 // =====================================================
@@ -618,7 +618,7 @@ PropagatedParams fitResultToProps(const FitResult& r) {
 // MAIN FUNCTION - POSITRON PID
 // =====================================================
 
-void pid_ep_cut_pp45_exp() {
+void pid_ep_cut_pp158_exp() {
   gROOT->SetBatch(kFALSE);
   gStyle->SetOptStat(0);
   gStyle->SetOptFit(111);
@@ -664,7 +664,7 @@ void pid_ep_cut_pp45_exp() {
   // Main histogram: p vs Δβ (positron)
   const char* h2name = "h2_ep_deltaBeta";
   TString drawCmd = Form(
-    "ep_beta - ep_p/sqrt(ep_p*ep_p + %.4f*%.4f) : ep_p >> %s(400,0,1600,300,-0.15,0.15)",
+    "ep_beta - ep_p/sqrt(ep_p*ep_p + %.4f*%.4f) : ep_p >> %s(280,0,1400,300,-0.15,0.15)",
     gPositronMass, gPositronMass, h2name);
 
   if (gDirectory->FindObject(h2name)) gDirectory->Delete(Form("%s;*", h2name));
@@ -682,7 +682,7 @@ void pid_ep_cut_pp45_exp() {
   // (p, β) histogram
   const char* h2pb_name = "h2_ep_beta";
   if (gDirectory->FindObject(h2pb_name)) gDirectory->Delete(Form("%s;*", h2pb_name));
-  chain->Draw(Form("ep_beta : ep_p >> %s(400,0,1600,300,0.0,1.2)", h2pb_name), 
+  chain->Draw(Form("ep_beta : ep_p >> %s(280,0,1400,300,0.0,1.2)", h2pb_name), 
               "eVertReco_z>-500 && ep_p>0 && ep_beta>0 && ep_beta<1.5 && start_iteration==3", "colz");
   TH2F* h2PB = static_cast<TH2F*>(gDirectory->Get(h2pb_name));
   if (h2PB) {
@@ -713,7 +713,7 @@ void pid_ep_cut_pp45_exp() {
   // Y-axis: mass² = p²(1/β² - 1)
   const char* h2m2_name = "h2_ep_mass2";
   if (gDirectory->FindObject(h2m2_name)) gDirectory->Delete(Form("%s;*", h2m2_name));
-  chain->Draw(Form("ep_p*ep_p*(1.0/(ep_beta*ep_beta) - 1) : ep_p >> %s(400,0,1600,400,-20000,60000)", h2m2_name), 
+  chain->Draw(Form("ep_p*ep_p*(1.0/(ep_beta*ep_beta) - 1) : ep_p >> %s(280,0,1400,400,-20000,60000)", h2m2_name), 
               "eVertReco_z>-500 && ep_p>0 && ep_beta>0.1 && ep_beta<1.5 && start_iteration==3", "colz");
   TH2F* h2M2 = static_cast<TH2F*>(gDirectory->Get(h2m2_name));
   if (h2M2) {
