@@ -8,7 +8,7 @@
 #include <vector>
 
 void restore_cuts(const char* inTxt  = "cuts_dump.txt",
-                  const char* outFile = "pp45_pid_cuts_exp_ver2_new.root")
+                  const char* outFile = "pp45_pid_cuts_sim_ver3.root")
 {
     std::ifstream fin(inTxt);
     if (!fin.is_open()) {
